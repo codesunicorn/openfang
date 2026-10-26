@@ -640,11 +640,24 @@ impl BridgeManager {
                     if new_ones.is_empty() {
                         continue;
                     }
+                    // Prefer the adapter's live view (updated on every reply);
+                    // fall back to the last target we posted to, then to the
+                    // handle's recorded delivery history so a daemon restart
+                    // doesn't lose the routing target.
                     let target = match adapter_btn.last_target().await {
                         Some(t) => Some(t),
-                        None => last_target.clone(),
+                        None => match last_target.clone() {
+                            Some(t) => Some(t),
+                            None => handle.channel_target_for_approvals("discord").await,
+                        },
                     };
                     let Some((channel_id, thread_id)) = target else {
+                        // No known channel yet (nothing has been delivered
+                        // since boot). Try again on the next tick.
+                        debug!(
+                            "Approval watcher: {} pending approval(s) but no delivery target yet",
+                            new_ones.len()
+                        );
                         continue;
                     };
                     last_target = Some((channel_id.clone(), thread_id.clone()));

@@ -121,6 +121,17 @@ impl DiscordAdapter {
         }
     }
 
+    /// Seed the fallback delivery target (config `default_channel_id`).
+    ///
+    /// Used by the approval watcher so prompts can be posted before any human
+    /// has spoken in the channel since the daemon started.
+    pub fn with_default_channel(mut self, channel_id: Option<String>) -> Self {
+        if let Some(id) = channel_id.filter(|s| !s.is_empty()) {
+            self.last_target = Arc::new(RwLock::new(Some((id, String::new()))));
+        }
+        self
+    }
+
     /// Get the WebSocket gateway URL from the Discord API.
     async fn get_gateway_url(&self) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/gateway/bot");
@@ -444,6 +455,7 @@ impl ChannelAdapter for DiscordAdapter {
         let created_thread_ids = self.created_thread_ids.clone();
         let threaded_message_ids = self.threaded_message_ids.clone();
         let pending_interactions = self.pending_interactions.clone();
+        let last_target_shared = self.last_target.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
@@ -718,6 +730,19 @@ impl ChannelAdapter for DiscordAdapter {
                                                 .write()
                                                 .await
                                                 .insert(msg.platform_message_id.clone());
+                                        }
+
+                                        // Remember where humans are talking so
+                                        // approval prompts have a target even
+                                        // before the bot has replied anywhere.
+                                        {
+                                            let conv = msg
+                                                .thread_id
+                                                .clone()
+                                                .unwrap_or_else(|| msg.sender.platform_id.clone());
+                                            let parent = msg.sender.platform_id.clone();
+                                            *last_target_shared.write().await =
+                                                Some((parent, if msg.thread_id.is_some() { conv } else { String::new() }));
                                         }
 
                                         if tx.send(msg).await.is_err() {

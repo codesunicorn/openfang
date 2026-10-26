@@ -59,7 +59,7 @@ use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_types::agent::AgentId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use openfang_runtime::str_utils::safe_truncate_str;
 
@@ -775,11 +775,30 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
 
     /// Where approval prompts for a channel type should be posted.
     ///
-    /// Approvals are not conversation-scoped, so the adapter itself remembers
-    /// the last place it delivered a reply (see `ChannelAdapter::last_target`)
-    /// and the bridge posts prompts there.
-    async fn channel_target_for_approvals(&self, _channel: &str) -> Option<(String, String)> {
-        None
+    /// Approvals are not conversation-scoped. Primary source is the adapter's
+    /// live `last_target`; this is the restart fallback, reconstructing the
+    /// target from the most recent delivery receipts for any agent.
+    async fn channel_target_for_approvals(&self, channel: &str) -> Option<(String, String)> {
+        let agents = self
+            .kernel
+            .registry
+            .list()
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>();
+        let mut best: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+        for agent_id in agents {
+            for receipt in self.kernel.delivery_tracker.get_receipts(agent_id, 5) {
+                if receipt.channel != channel {
+                    continue;
+                }
+                if best.as_ref().map(|(t, _)| receipt.timestamp > *t).unwrap_or(true) {
+                    best = Some((receipt.timestamp, receipt.recipient.clone()));
+                }
+            }
+        }
+        // Receipts don't carry thread ids; post in the channel itself.
+        best.map(|(_, recipient)| (recipient, String::new()))
     }
 
     async fn list_approvals_text(&self) -> String {
@@ -1314,6 +1333,7 @@ pub async fn start_channel_bridge_with_config(
         || config.linkedin.is_some();
 
     if !has_any {
+        debug!("start_channel_bridge: no channels configured — skipping");
         return (None, Vec::new());
     }
 
@@ -1343,14 +1363,18 @@ pub async fn start_channel_bridge_with_config(
     // Discord
     if let Some(ref dc_config) = config.discord {
         if let Some(token) = read_token(&dc_config.bot_token_env, "Discord") {
-            let adapter = Arc::new(DiscordAdapter::new(
-                token,
-                dc_config.allowed_guilds.clone(),
-                dc_config.allowed_users.clone(),
-                dc_config.ignore_bots,
-                dc_config.intents,
-                dc_config.auto_thread.clone(),
-            ));
+            let adapter = Arc::new(
+                DiscordAdapter::new(
+                    token,
+                    dc_config.allowed_guilds.clone(),
+                    dc_config.allowed_users.clone(),
+                    dc_config.ignore_bots,
+                    dc_config.intents,
+                    dc_config.auto_thread.clone(),
+                )
+                // Fallback target for unprompted messages (approval prompts).
+                .with_default_channel(dc_config.default_channel_id.clone()),
+            );
             adapters.push((adapter, dc_config.default_agent.clone()));
         }
     }
