@@ -5,6 +5,7 @@
 
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
+    LifecycleReaction,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
@@ -77,6 +78,10 @@ pub struct DiscordAdapter {
     /// Populated immediately when MESSAGE_CREATE is forwarded — before bridge processing —
     /// to eliminate the race window where MESSAGE_UPDATE arrives before thread creation completes.
     threaded_message_ids: Arc<RwLock<HashSet<String>>>,
+    /// Last lifecycle emoji this bot added per message (message_id → emoji).
+    /// Used to remove the previous phase reaction (⏳ → 🤔 → ✅) without touching
+    /// persistent markers like the 🧵 thread indicator (hermes threadbot parity).
+    last_reactions: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl DiscordAdapter {
@@ -104,6 +109,7 @@ impl DiscordAdapter {
             resume_gateway_url: Arc::new(RwLock::new(None)),
             created_thread_ids: Arc::new(RwLock::new(HashMap::new())),
             threaded_message_ids: Arc::new(RwLock::new(HashSet::new())),
+            last_reactions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -162,6 +168,68 @@ impl DiscordAdapter {
             .header("Authorization", format!("Bot {}", self.token.as_str()))
             .send()
             .await?;
+        Ok(())
+    }
+
+    /// Percent-encode a reaction emoji for use in a REST path segment.
+    /// Discord expects unicode emoji URL-encoded (e.g. "🧵" → "%F0%9F%A7%B5").
+    fn encode_reaction_emoji(emoji: &str) -> String {
+        let mut encoded = String::new();
+        for byte in emoji.bytes() {
+            if byte.is_ascii_alphanumeric() {
+                encoded.push(byte as char);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        encoded
+    }
+
+    /// Add a reaction to a message (best-effort; errors logged, not fatal).
+    async fn api_add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = Self::encode_reaction_emoji(emoji);
+        let url = format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me"
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord addReaction failed: {body_text}");
+        }
+        Ok(())
+    }
+
+    /// Remove the bot's own reaction from a message (best-effort).
+    async fn api_remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = Self::encode_reaction_emoji(emoji);
+        let url = format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me"
+        );
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord removeReaction failed: {body_text}");
+        }
         Ok(())
     }
 
@@ -696,6 +764,55 @@ impl ChannelAdapter for DiscordAdapter {
 
     async fn send_typing(&self, user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
         self.api_send_typing(&user.platform_id).await
+    }
+
+    /// Lifecycle reactions (⏳🤔✅❌ + 🧵 thread marker).
+    ///
+    /// Hermes/kimaki parity: the user gets instant visual acknowledgment on the
+    /// original message, and phase transitions swap the emoji. The 🧵 thread
+    /// marker is never removed by later phases — it marks "this spawned a thread".
+    async fn send_reaction(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+        reaction: &LifecycleReaction,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const THREAD_MARKER: &str = "\u{1F9F5}"; // 🧵
+        let channel_id = &user.platform_id;
+        let emoji = reaction.emoji.trim();
+
+        if emoji.is_empty() {
+            return Ok(());
+        }
+
+        // Remove the previous phase emoji (never the persistent 🧵 marker).
+        if reaction.remove_previous {
+            let previous = self
+                .last_reactions
+                .read()
+                .await
+                .get(message_id)
+                .cloned();
+            if let Some(prev) = previous {
+                if prev != THREAD_MARKER && prev != emoji {
+                    self.api_remove_reaction(channel_id, message_id, &prev)
+                        .await?;
+                }
+            }
+        }
+
+        self.api_add_reaction(channel_id, message_id, emoji).await?;
+
+        // Track the last reaction per message; bound the map so it can't grow
+        // unbounded in long-lived daemons (drop oldest when over cap).
+        {
+            let mut map = self.last_reactions.write().await;
+            if map.len() > 2_000 {
+                map.clear();
+            }
+            map.insert(message_id.to_string(), emoji.to_string());
+        }
+        Ok(())
     }
 
     async fn send_in_thread(

@@ -648,6 +648,21 @@ async fn send_lifecycle_reaction(
     let _ = adapter.send_reaction(user, message_id, &reaction).await;
 }
 
+/// Build the typing-indicator target for a message.
+///
+/// When the conversation has been moved into a thread (auto-thread), the
+/// typing indicator must appear in the THREAD, not the parent channel —
+/// otherwise the user staring at the freshly created thread sees no
+/// "is typing…" feedback at all (hermes/kimaki lesson: the user watches
+/// the thread, not the channel the mention was posted in).
+fn typing_target(message: &ChannelMessage, thread_id: Option<&str>) -> ChannelUser {
+    let mut u = message.sender.clone();
+    if let Some(tid) = thread_id {
+        u.platform_id = tid.to_string();
+    }
+    u
+}
+
 /// Spawn a background task that refreshes the typing indicator every 4 seconds.
 ///
 /// Returns a `JoinHandle` that should be aborted once the LLM call completes.
@@ -863,16 +878,36 @@ async fn dispatch_message(
 
     // --- Create auto-thread NOW (after all policy guards have passed) ---
     if let Some(ref thread_name) = auto_thread_name {
-        match adapter
+        // Stringify the error so the match scrutinee is Send — the Ok arm
+        // below awaits (🧵 reaction) while holding the match value, and
+        // `Box<dyn StdError>` is not `Send`.
+        let thread_result: Result<String, String> = adapter
             .create_thread(&message.sender, &message.platform_message_id, thread_name)
             .await
-        {
+            .map_err(|e| e.to_string());
+        match thread_result {
             Ok(new_thread_id) => {
                 info!(
                     "Created auto-thread {} for message {}",
                     thread_name, message.platform_message_id
                 );
                 effective_thread_id = Some(new_thread_id);
+                // Hermes threadbot parity: react 🧵 on the original message so
+                // the user instantly sees the conversation was threaded.
+                if lifecycle_reactions {
+                    let thread_ack = LifecycleReaction {
+                        emoji: "\u{1F9F5}".to_string(), // 🧵
+                        phase: AgentPhase::Queued,
+                        remove_previous: false,
+                    };
+                    let _ = adapter
+                        .send_reaction(
+                            &message.sender,
+                            &message.platform_message_id,
+                            &thread_ack,
+                        )
+                        .await;
+                }
             }
             Err(e) => {
                 warn!("Failed to create auto-thread: {}", e);
@@ -1134,9 +1169,10 @@ async fn dispatch_message(
                 .await;
                 return;
             }
-            let _ = adapter.send_typing(&message.sender).await;
+            let typing_user = typing_target(&message, thread_id);
+            let _ = adapter.send_typing(&typing_user).await;
 
-            let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+            let typing_task = spawn_typing_loop(adapter_arc.clone(), typing_user);
 
             let strategy = router.broadcast_strategy();
             let mut responses = Vec::new();
@@ -1291,10 +1327,13 @@ async fn dispatch_message(
         return;
     }
 
-    // Send typing indicator (best-effort)
-    let _ = adapter.send_typing(&message.sender).await;
+    // Send typing indicator (best-effort) — inside the thread if one was created
+    let typing_user = typing_target(&message, thread_id);
+    let _ = adapter.send_typing(&typing_user).await;
 
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
+    // These go on the ORIGINAL message (parent channel), which is where the
+    // user's mention lives — not inside the thread.
     let msg_id = &message.platform_message_id;
     if lifecycle_reactions {
         send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
@@ -1303,7 +1342,7 @@ async fn dispatch_message(
 
     // Continuous typing indicator — refreshes every 4s so platforms like Telegram
     // (which expire typing after ~5s) keep showing it during long LLM calls.
-    let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+    let typing_task = spawn_typing_loop(adapter_arc.clone(), typing_user.clone());
 
     // Prepend sender context so the agent knows who is speaking.
     // In group spaces this is essential for multi-user conversations.
@@ -1358,7 +1397,7 @@ async fn dispatch_message(
         Err(e) => {
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
-                let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+                let typing_task2 = spawn_typing_loop(adapter_arc.clone(), typing_user.clone());
                 let retry = handle.send_message(new_id, &text).await;
                 typing_task2.abort();
                 match retry {
@@ -1772,7 +1811,9 @@ async fn dispatch_with_blocks(
         return;
     }
 
-    let _ = adapter.send_typing(&message.sender).await;
+    // Typing goes into the thread when one exists (hermes/kimaki lesson)
+    let typing_user = typing_target(&message, thread_id);
+    let _ = adapter.send_typing(&typing_user).await;
 
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
     let msg_id = &message.platform_message_id;
@@ -1782,7 +1823,7 @@ async fn dispatch_with_blocks(
     }
 
     // Continuous typing indicator (see spawn_typing_loop doc)
-    let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+    let typing_task = spawn_typing_loop(adapter_arc.clone(), typing_user.clone());
 
     let result = handle
         .send_message_with_blocks(agent_id, blocks.clone())
@@ -1822,7 +1863,7 @@ async fn dispatch_with_blocks(
         Err(e) => {
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
-                let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+                let typing_task2 = spawn_typing_loop(adapter_arc.clone(), typing_user.clone());
                 let retry = handle.send_message_with_blocks(new_id, blocks).await;
                 typing_task2.abort();
                 match retry {
