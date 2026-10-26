@@ -4,7 +4,7 @@
 //! for sending responses. No external Discord crate — just `tokio-tungstenite` + `reqwest`.
 
 use crate::types::{
-    split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
+    split_message_fenced, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
     LifecycleReaction,
 };
 use async_trait::async_trait;
@@ -139,7 +139,9 @@ impl DiscordAdapter {
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-        let chunks = split_message(text, DISCORD_MSG_LIMIT);
+        // Fence-aware so long code answers don't render as broken blocks
+        // (hermes/kimaki parity).
+        let chunks = split_message_fenced(text, DISCORD_MSG_LIMIT);
 
         for chunk in chunks {
             let body = serde_json::json!({ "content": chunk });
@@ -356,7 +358,7 @@ impl DiscordAdapter {
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{thread_id}/messages");
-        let chunks = split_message(text, DISCORD_MSG_LIMIT);
+        let chunks = split_message_fenced(text, DISCORD_MSG_LIMIT);
 
         for chunk in chunks {
             let body = serde_json::json!({ "content": chunk });

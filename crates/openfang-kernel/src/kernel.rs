@@ -1877,6 +1877,51 @@ impl OpenFangKernel {
         .await
     }
 
+    /// Resolve the session a scoped conversation should use.
+    ///
+    /// Per-thread sessions (hermes/kimaki parity): channel bridges pass a
+    /// conversation scope (Discord thread id) so every thread gets its own
+    /// history instead of all threads sharing one ever-growing agent session.
+    ///
+    /// The id is derived deterministically from (agent, scope, epoch) so it
+    /// survives restarts without extra bookkeeping. `epoch` is carried in the
+    /// scope string by the caller, letting a `/reset` command invalidate every
+    /// thread at once. The derived session is persisted on first use.
+    fn resolve_scoped_session(
+        &self,
+        agent_id: AgentId,
+        base_session_id: openfang_types::agent::SessionId,
+        scope: Option<&str>,
+    ) -> KernelResult<openfang_types::agent::SessionId> {
+        let Some(scope) = scope.filter(|s| !s.is_empty()) else {
+            return Ok(base_session_id);
+        };
+
+        // Deterministic UUIDv5: stable across restarts, unique per scope.
+        //
+        // `base_session_id` is the agent's current default session — it is
+        // rotated by /reset and /sessions, so folding it in here means a reset
+        // gives every conversation a fresh history with no extra plumbing.
+        let derived = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("{}:{}:{}", agent_id.0, base_session_id.0, scope).as_bytes(),
+        );
+        let scoped_id = openfang_types::agent::SessionId(derived);
+
+        // Ensure the session row exists (idempotent).
+        if self
+            .memory
+            .get_session(scoped_id)
+            .map_err(KernelError::OpenFang)?
+            .is_none()
+        {
+            self.memory
+                .create_session_with_id(scoped_id, agent_id)
+                .map_err(KernelError::OpenFang)?;
+        }
+        Ok(scoped_id)
+    }
+
     /// Send a message with optional content blocks and an optional kernel handle.
     ///
     /// When `content_blocks` is `Some`, the LLM agent loop receives structured
@@ -1895,13 +1940,52 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
-        // Acquire per-agent lock to serialize concurrent messages for the same agent.
-        // This prevents session corruption when multiple messages arrive in quick
-        // succession (e.g. rapid voice messages via Telegram). Messages for different
-        // agents are not blocked — each agent has its own independent lock.
+        self.send_message_scoped(
+            agent_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+            None,
+        )
+        .await
+    }
+
+    /// Scoped variant: `scope` selects a per-conversation session
+    /// (Discord thread / Slack channel). None = the agent's default session.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_scoped(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        scope: Option<&str>,
+    ) -> KernelResult<AgentLoopResult> {
+        // Acquire a lock to serialize concurrent messages for the same
+        // conversation. This prevents session corruption when multiple messages
+        // arrive in quick succession (e.g. rapid voice messages via Telegram).
+        //
+        // Per-thread sessions: the lock is keyed per (agent, scope) so that
+        // different Discord threads run CONCURRENTLY (each thread has its own
+        // session, so there is nothing to corrupt) while messages inside one
+        // thread stay ordered. Keying per agent alone would make the second
+        // thread wait minutes for the first thread's research task.
+        let lock_key = match scope {
+            Some(s) if !s.is_empty() => {
+                AgentId(uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    format!("{}:lock:{}", agent_id.0, s).as_bytes(),
+                ))
+            }
+            _ => agent_id,
+        };
         let lock = self
             .agent_msg_locks
-            .entry(agent_id)
+            .entry(lock_key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1931,6 +2015,7 @@ impl OpenFangKernel {
                 content_blocks,
                 sender_id,
                 sender_name,
+                scope,
             )
             .await
         };
@@ -1989,6 +2074,32 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+    ) -> KernelResult<(
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+        tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
+    )> {
+        self.send_message_streaming_scoped(
+            agent_id,
+            message,
+            kernel_handle,
+            sender_id,
+            sender_name,
+            content_blocks,
+            None,
+        )
+    }
+
+    /// Scoped streaming variant — `scope` selects a per-conversation session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_message_streaming_scoped(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        scope: Option<String>,
     ) -> KernelResult<(
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
@@ -2057,12 +2168,14 @@ impl OpenFangKernel {
         }
 
         // LLM agent: true streaming via agent loop
+        // Per-thread sessions: resolve the conversation's own session.
+        let session_id = self.resolve_scoped_session(agent_id, entry.session_id, scope.as_deref())?;
         let mut session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(session_id)
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: session_id,
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,
@@ -2637,18 +2750,22 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        scope: Option<&str>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
+        // Per-thread sessions: resolve the conversation's own session.
+        let session_id = self.resolve_scoped_session(agent_id, entry.session_id, scope)?;
+
         let mut session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session(session_id)
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
+                id: session_id,
                 agent_id,
                 messages: Vec::new(),
                 context_window_tokens: 0,

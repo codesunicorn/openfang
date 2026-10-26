@@ -115,6 +115,62 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(self.kernel.registry.find_by_name(name).map(|e| e.id))
     }
 
+    /// Transcribe an audio URL (voice messages) via the kernel media engine.
+    /// Auto-cascades to whatever STT provider is configured (Groq/OpenAI/local).
+    async fn transcribe_audio_url(&self, url: &str, mime_type: &str) -> Result<String, String> {
+        let attachment = openfang_types::media::MediaAttachment {
+            media_type: openfang_types::media::MediaType::Audio,
+            mime_type: mime_type.to_string(),
+            source: openfang_types::media::MediaSource::Url {
+                url: url.to_string(),
+            },
+            size_bytes: 0,
+        };
+        let result = self
+            .kernel
+            .media_engine
+            .transcribe_audio(&attachment)
+            .await?;
+        Ok(result.description)
+    }
+
+    /// Per-conversation session scope (hermes/kimaki parity).
+    ///
+    /// Discord: one session per thread/channel, so a thread keeps its own
+    /// history instead of every thread sharing one ever-growing agent session.
+    /// Also includes a per-agent epoch that the `/reset` (session reset)
+    /// command bumps — no extra plumbing needed, because resetting rotates
+    /// `entry.session_id`, which the scope string embeds.
+    async fn conversation_scope(
+        &self,
+        message: &openfang_channels::types::ChannelMessage,
+    ) -> Option<String> {
+        // Only chat platforms with real conversation containers get scoped
+        // sessions; one-off transports (SMS/email/webhooks) keep the default.
+        if !matches!(
+            message.channel,
+            openfang_channels::types::ChannelType::Discord
+                | openfang_channels::types::ChannelType::Slack
+                | openfang_channels::types::ChannelType::Telegram
+        ) {
+            return None;
+        }
+        let conv = message.thread_id.clone().unwrap_or_else(|| {
+            message
+                .metadata
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| message.sender.platform_id.clone())
+        });
+        if conv.is_empty() {
+            return None;
+        }
+        // Scope is just the conversation container; the kernel folds in the
+        // agent's session epoch so `/reset` invalidates every thread.
+        Some(conv)
+    }
+
     /// Streaming send (hermes/kimaki parity): forwards kernel StreamEvents to
     /// the bridge as BridgeStreamEvents while the agent runs, then resolves to
     /// the final response. Mirrors the semantics of the blocking paths.
@@ -125,6 +181,19 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         events: tokio::sync::mpsc::Sender<openfang_channels::types::BridgeStreamEvent>,
     ) -> Result<String, String> {
+        self.send_message_scoped_streaming(agent_id, message, blocks, events, None)
+            .await
+    }
+
+    /// Scoped streaming send: `scope` = per-conversation session key.
+    async fn send_message_scoped_streaming(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        events: tokio::sync::mpsc::Sender<openfang_channels::types::BridgeStreamEvent>,
+        scope: Option<String>,
+    ) -> Result<String, String> {
         use openfang_channels::types::BridgeStreamEvent;
         use openfang_runtime::llm_driver::StreamEvent;
 
@@ -132,7 +201,9 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         let blocks_param_is_none = blocks.is_none();
         let (mut rx, jh) = self
             .kernel
-            .send_message_streaming(agent_id, message, None, None, None, blocks)
+            .send_message_streaming_scoped(
+                agent_id, message, None, None, None, blocks, scope,
+            )
             .map_err(|e| format!("{e}"))?;
 
         while let Some(ev) = rx.recv().await {

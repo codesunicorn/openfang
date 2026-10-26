@@ -195,6 +195,27 @@ impl SessionStore {
         Ok(session)
     }
 
+    /// Create a session with a caller-supplied ID.
+    ///
+    /// Used for deterministic per-conversation sessions (Discord threads,
+    /// Slack channels): the ID is derived from (agent, conversation scope) so
+    /// history survives daemon restarts without extra bookkeeping.
+    pub fn create_session_with_id(
+        &self,
+        id: SessionId,
+        agent_id: AgentId,
+    ) -> OpenFangResult<Session> {
+        let session = Session {
+            id,
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        self.save_session(&session)?;
+        Ok(session)
+    }
+
     /// Set the label on an existing session.
     pub fn set_session_label(
         &self,

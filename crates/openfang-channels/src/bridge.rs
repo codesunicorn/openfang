@@ -102,6 +102,16 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
 
+    /// Opaque conversation scope for per-thread sessions (hermes/kimaki parity).
+    ///
+    /// Return `Some(key)` to make this conversation use its own agent session
+    /// (Discord: the thread/channel id). Return `None` for the legacy shared
+    /// per-agent session. Implementations are expected to include an epoch so
+    /// `/reset`-style commands can invalidate every thread at once.
+    async fn conversation_scope(&self, _message: &ChannelMessage) -> Option<String> {
+        None
+    }
+
     /// Streaming send with live preview support (hermes/kimaki parity).
     ///
     /// Streams `BridgeStreamEvent`s into `events` while the agent runs; resolves
@@ -114,6 +124,22 @@ pub trait ChannelBridgeHandle: Send + Sync {
         message: &str,
         blocks: Option<Vec<ContentBlock>>,
         events: tokio::sync::mpsc::Sender<crate::types::BridgeStreamEvent>,
+    ) -> Result<String, String> {
+        self.send_message_scoped_streaming(agent_id, message, blocks, events, None)
+            .await
+    }
+
+    /// Streaming send within a conversation scope (per-thread session).
+    ///
+    /// Default implementation ignores the scope and defers to the unscoped
+    /// streaming path, so existing handle impls keep their behavior.
+    async fn send_message_scoped_streaming(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Option<Vec<ContentBlock>>,
+        events: tokio::sync::mpsc::Sender<crate::types::BridgeStreamEvent>,
+        _scope: Option<String>,
     ) -> Result<String, String> {
         let _ = events
             .send(crate::types::BridgeStreamEvent::Complete)
@@ -159,6 +185,14 @@ pub trait ChannelBridgeHandle: Send + Sync {
         _audio_bytes: Vec<u8>,
         _mime_type: &str,
     ) -> Result<String, String> {
+        Err("Audio transcription not available.".to_string())
+    }
+
+    /// Transcribe audio fetched from a URL (voice messages).
+    ///
+    /// Voice notes on Discord/Telegram arrive as a URL (often `.ogg`); the
+    /// bridge downloads and delegates here. Default: no transcription.
+    async fn transcribe_audio_url(&self, _url: &str, _mime_type: &str) -> Result<String, String> {
         Err("Audio transcription not available.".to_string())
     }
 
@@ -744,6 +778,7 @@ async fn run_with_preview(
     agent_id: AgentId,
     text: &str,
     blocks: Option<Vec<ContentBlock>>,
+    scope: Option<String>,
 ) -> Result<String, String> {
     let start = Instant::now();
 
@@ -772,7 +807,7 @@ async fn run_with_preview(
         let text = text.to_string();
         tokio::spawn(async move {
             handle
-                .send_message_streaming(agent_id, &text, blocks, event_tx)
+                .send_message_scoped_streaming(agent_id, &text, blocks, event_tx, scope)
                 .await
         })
     };
@@ -1134,10 +1169,29 @@ async fn dispatch_message(
                     url,
                     duration_seconds,
                 } => {
-                    blocks.push(ContentBlock::Text {
-                        text: format!("[User sent a voice message ({duration_seconds}s): {url}]"),
-                        provider_metadata: None,
-                    });
+                    // Transcribe the voice note so the agent can actually
+                    // respond to it. Passing a bare URL to the LLM (the old
+                    // behavior) is useless — the model cannot listen to it.
+                    let transcript = handle
+                        .transcribe_audio_url(url, "audio/ogg")
+                        .await
+                        .ok()
+                        .filter(|t| !t.trim().is_empty());
+                    match transcript {
+                        Some(text) => blocks.push(ContentBlock::Text {
+                            text: format!(
+                                "[Voice message ({duration_seconds}s), transcribed]: {text}"
+                            ),
+                            provider_metadata: None,
+                        }),
+                        None => blocks.push(ContentBlock::Text {
+                            text: format!(
+                                "[User sent a voice message ({duration_seconds}s) that could \
+                                 not be transcribed — ask them to type it out: {url}]"
+                            ),
+                            provider_metadata: None,
+                        }),
+                    }
                 }
                 ChannelContent::Location { lat, lon } => {
                     blocks.push(ContentBlock::Text {
@@ -1541,6 +1595,9 @@ async fn dispatch_message(
         text.clone()
     };
 
+    // Per-thread session scope (hermes/kimaki parity) — None = legacy shared.
+    let scope = handle.conversation_scope(&message).await;
+
     // Send to agent and relay response (streaming preview when supported)
     let result = if adapter_arc.supports_preview() {
         run_with_preview(
@@ -1551,6 +1608,7 @@ async fn dispatch_message(
             agent_id,
             &prefixed_text,
             None,
+            scope,
         )
         .await
     } else {
@@ -2010,6 +2068,9 @@ async fn dispatch_with_blocks(
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), typing_user.clone());
 
+    // Per-thread session scope (hermes/kimaki parity) — None = legacy shared.
+    let scope = handle.conversation_scope(&message).await;
+
     // Streaming preview when supported (hermes/kimaki parity); falls back to
     // the blocking blocks call otherwise.
     let result = if adapter_arc.supports_preview() {
@@ -2031,6 +2092,7 @@ async fn dispatch_with_blocks(
             agent_id,
             &blocks_text,
             Some(blocks.clone()),
+            scope,
         )
         .await
     } else {

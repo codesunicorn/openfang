@@ -463,6 +463,72 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<&str> {
     chunks
 }
 
+/// Split a message into fenced-code-aware chunks.
+///
+/// Plain `split_message` can cut in the middle of a ``` fence, so the first
+/// chunk renders broken and the remainder renders as one giant code block
+/// (or vice-versa). This variant closes an open fence at the end of a chunk
+/// and re-opens it (with the same language tag) at the start of the next —
+/// the behavior hermes/kimaki users expect for long code answers.
+pub fn split_message_fenced(text: &str, max_len: usize) -> Vec<String> {
+    if text.len() <= max_len {
+        return vec![text.to_string()];
+    }
+    // Reserve room for the synthetic closing/opening fences.
+    const FENCE_RESERVE: usize = 12;
+    let budget = max_len.saturating_sub(FENCE_RESERVE).max(64);
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    // Some("") for a bare ```, Some("rust") for ```rust.
+    let mut open_fence: Option<String> = None;
+
+    for line in text.split_inclusive('\n') {
+        let is_fence_line = line.trim_start().starts_with("```");
+        let line_len = line.len();
+
+        // Would adding this line overflow the current chunk?
+        if !current.is_empty() && current.len() + line_len > budget {
+            // Close any open fence before emitting, so the chunk renders.
+            if let Some(lang) = &open_fence {
+                current.push_str("```\n");
+                let _ = lang;
+            }
+            chunks.push(std::mem::take(&mut current));
+            // Re-open the fence in the next chunk so code stays code.
+            if let Some(lang) = &open_fence {
+                current.push_str("```");
+                current.push_str(lang);
+                current.push('\n');
+            }
+        }
+
+        current.push_str(line);
+
+        // Track fence state (toggle on each fence line).
+        if is_fence_line {
+            match open_fence {
+                Some(_) => open_fence = None,
+                None => {
+                    let tag = line.trim_start().trim_start_matches("```").trim();
+                    open_fence = Some(tag.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(_) = &open_fence {
+        current.push_str("```\n");
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +722,54 @@ mod tests {
         };
         let json = serde_json::to_string(&receipt).unwrap();
         assert!(json.contains("Connection refused"));
+    }
+
+    #[test]
+    fn test_split_message_fenced_short_passthrough() {
+        let out = split_message_fenced("hello world", 2000);
+        assert_eq!(out, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn test_split_message_fenced_balances_code_block() {
+        // A long fenced block must be closed in chunk 1 and re-opened in chunk 2
+        // with the same language tag, so each chunk renders as valid markdown.
+        let mut body = String::from("intro\n```rust\n");
+        for i in 0..200 {
+            body.push_str(&format!("let x{i} = {i};\n"));
+        }
+        body.push_str("```\nend\n");
+
+        let chunks = split_message_fenced(&body, 500);
+        assert!(chunks.len() > 1, "expected multiple chunks");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= 500, "chunk {i} exceeds limit: {}", c.len());
+        }
+        // First chunk must close the fence it opened.
+        assert_eq!(
+            chunks[0].matches("```").count() % 2,
+            0,
+            "chunk 0 has unbalanced fences:\n{}",
+            chunks[0]
+        );
+        // Any chunk that re-opens a fence must also close it.
+        for (i, c) in chunks.iter().enumerate().skip(1) {
+            assert_eq!(
+                c.matches("```").count() % 2,
+                0,
+                "chunk {i} has unbalanced fences:\n{}",
+                c
+            );
+        }
+        // Language tag preserved on continuation chunks.
+        assert!(chunks[1].starts_with("```rust"), "got: {:?}", &chunks[1][..20.min(chunks[1].len())]);
+    }
+
+    #[test]
+    fn test_split_message_fenced_plain_text_still_splits() {
+        let body = "line\n".repeat(400);
+        let chunks = split_message_fenced(&body, 300);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= 300));
     }
 }

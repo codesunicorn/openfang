@@ -212,6 +212,15 @@ impl MemorySubstrate {
         self.sessions.create_session(agent_id)
     }
 
+    /// Create a session with a caller-supplied ID (per-conversation sessions).
+    pub fn create_session_with_id(
+        &self,
+        id: SessionId,
+        agent_id: AgentId,
+    ) -> OpenFangResult<Session> {
+        self.sessions.create_session_with_id(id, agent_id)
+    }
+
     /// List all sessions with metadata.
     pub fn list_sessions(&self) -> OpenFangResult<Vec<serde_json::Value>> {
         self.sessions.list_sessions()
