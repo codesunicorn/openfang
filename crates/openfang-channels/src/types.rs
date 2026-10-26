@@ -209,6 +209,60 @@ pub struct LifecycleReaction {
     pub remove_previous: bool,
 }
 
+/// An interactive component attached to an outbound message.
+///
+/// Currently used for approval prompts: the adapter renders platform-native
+/// buttons (Discord components) and reports clicks back through
+/// `ChannelAdapter::next_interaction`, so users never have to type
+/// `/approve <uuid>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ButtonSpec {
+    /// Opaque id echoed back on click (e.g. "approve:<uuid>").
+    pub custom_id: String,
+    /// Button label (max ~80 chars on Discord).
+    pub label: String,
+    /// Visual style: "primary" | "secondary" | "success" | "danger".
+    #[serde(default = "default_button_style")]
+    pub style: String,
+}
+
+fn default_button_style() -> String {
+    "secondary".to_string()
+}
+
+impl ButtonSpec {
+    /// Convenience constructor for an approve/deny pair.
+    pub fn approval_pair(request_id: &str) -> (Self, Self) {
+        (
+            Self {
+                custom_id: format!("approve:{request_id}"),
+                label: "Approve".to_string(),
+                style: "success".to_string(),
+            },
+            Self {
+                custom_id: format!("deny:{request_id}"),
+                label: "Deny".to_string(),
+                style: "danger".to_string(),
+            },
+        )
+    }
+}
+
+/// A click on an interactive component, delivered from the adapter to the bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentInteraction {
+    /// The `custom_id` of the clicked button.
+    pub custom_id: String,
+    /// Message the button belongs to (so the adapter can edit/disable it).
+    pub message_id: String,
+    /// Conversation container (channel or thread) the button lives in.
+    pub channel_id: String,
+    /// Who clicked (platform user id).
+    pub user_id: String,
+    /// Display name of the clicker, for confirmation text.
+    pub user_name: String,
+}
+
 /// Bridge-level view of kernel streaming events (crate-neutral mirror of
 /// `openfang_runtime::llm_driver::StreamEvent`; the channels crate cannot
 /// depend on the runtime crate, so events are re-projected here by the
@@ -431,6 +485,54 @@ pub trait ChannelAdapter: Send + Sync {
         _message_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Interactive components (approval buttons)
+    // ------------------------------------------------------------------
+
+    /// Whether this adapter can render native buttons.
+    fn supports_buttons(&self) -> bool {
+        false
+    }
+
+    /// Send a message with buttons, returning the platform message id.
+    async fn send_with_buttons(
+        &self,
+        _user: &ChannelUser,
+        _thread_id: Option<&str>,
+        _text: &str,
+        _buttons: Vec<ButtonSpec>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        Err("Buttons not supported for this adapter".into())
+    }
+
+    /// Replace a message's buttons with a plain text resolution line
+    /// (so the same approval can't be clicked twice).
+    async fn resolve_button_message(
+        &self,
+        _user: &ChannelUser,
+        _thread_id: Option<&str>,
+        _message_id: &str,
+        _text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    /// Most recent delivery target as `(channel_id, thread_id)` (empty thread
+    /// = the channel itself). Used to route approval prompts to wherever the
+    /// user is actually talking. Default: unknown.
+    async fn last_target(&self) -> Option<(String, String)> {
+        None
+    }
+
+    /// Take the next pending component interaction, if any.
+    ///
+    /// Adapters that support buttons push clicks into an internal queue while
+    /// their gateway loop runs; the bridge polls this when it needs to resolve
+    /// a pending approval. Returns `None` when the queue is empty.
+    async fn next_interaction(&self) -> Option<ComponentInteraction> {
+        None
     }
 }
 

@@ -745,6 +745,43 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
     }
 
+    /// Pending approvals as text (consumed by the approval-button watcher).
+    async fn pending_approvals_text(&self) -> String {
+        self.list_approvals_text().await
+    }
+
+    /// Pending approvals as structured (full_id, summary) pairs.
+    async fn pending_approvals_list(&self) -> Vec<(String, String)> {
+        self.kernel
+            .approval_manager
+            .list_pending()
+            .into_iter()
+            .map(|req| {
+                let summary = format!(
+                    "**{}** wants to run `{}`{}\nRisk: {:?}",
+                    req.agent_id,
+                    req.tool_name,
+                    if req.action_summary.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n> {}", req.action_summary)
+                    },
+                    req.risk_level
+                );
+                (req.id.to_string(), summary)
+            })
+            .collect()
+    }
+
+    /// Where approval prompts for a channel type should be posted.
+    ///
+    /// Approvals are not conversation-scoped, so the adapter itself remembers
+    /// the last place it delivered a reply (see `ChannelAdapter::last_target`)
+    /// and the bridge posts prompts there.
+    async fn channel_target_for_approvals(&self, _channel: &str) -> Option<(String, String)> {
+        None
+    }
+
     async fn list_approvals_text(&self) -> String {
         let pending = self.kernel.approval_manager.list_pending();
         if pending.is_empty() {

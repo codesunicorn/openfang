@@ -4,8 +4,8 @@
 //! for sending responses. No external Discord crate — just `tokio-tungstenite` + `reqwest`.
 
 use crate::types::{
-    split_message_fenced, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
-    LifecycleReaction,
+    split_message_fenced, ButtonSpec, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType,
+    ChannelUser, ComponentInteraction, LifecycleReaction,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
@@ -82,6 +82,12 @@ pub struct DiscordAdapter {
     /// Used to remove the previous phase reaction (⏳ → 🤔 → ✅) without touching
     /// persistent markers like the 🧵 thread indicator (hermes threadbot parity).
     last_reactions: Arc<RwLock<HashMap<String, String>>>,
+    /// Button clicks received from the gateway (INTERACTION_CREATE), awaiting
+    /// resolution by the bridge. Approval prompts poll this.
+    pending_interactions: Arc<Mutex<Vec<ComponentInteraction>>>,
+    /// Last (channel, thread) the bot delivered to. Approvals are not
+    /// conversation-scoped, so prompts follow the user's latest activity.
+    last_target: Arc<RwLock<Option<(String, String)>>>,
 }
 
 impl DiscordAdapter {
@@ -110,6 +116,8 @@ impl DiscordAdapter {
             created_thread_ids: Arc::new(RwLock::new(HashMap::new())),
             threaded_message_ids: Arc::new(RwLock::new(HashSet::new())),
             last_reactions: Arc::new(RwLock::new(HashMap::new())),
+            pending_interactions: Arc::new(Mutex::new(Vec::new())),
+            last_target: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -435,6 +443,7 @@ impl ChannelAdapter for DiscordAdapter {
         let resume_url_store = self.resume_gateway_url.clone();
         let created_thread_ids = self.created_thread_ids.clone();
         let threaded_message_ids = self.threaded_message_ids.clone();
+        let pending_interactions = self.pending_interactions.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
@@ -733,6 +742,71 @@ impl ChannelAdapter for DiscordAdapter {
                                     }
                                 }
 
+                                // Approval buttons: user clicked a component.
+                                // Queue it and ACK the interaction (type 6 =
+                                // DEFERRED_UPDATE_MESSAGE) so Discord doesn't
+                                // show "This interaction failed".
+                                "INTERACTION_CREATE" => {
+                                    let itype = d["type"].as_u64().unwrap_or(0);
+                                    let interaction_id =
+                                        d["id"].as_str().unwrap_or("").to_string();
+                                    let token =
+                                        d["token"].as_str().unwrap_or("").to_string();
+
+                                    if itype == 3 {
+                                        // MESSAGE_COMPONENT
+                                        let custom_id = d["data"]["custom_id"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let message_id = d["message"]["id"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let channel_id = d["channel_id"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let user_id = d["member"]["user"]["id"]
+                                            .as_str()
+                                            .or_else(|| d["user"]["id"].as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let user_name = d["member"]["user"]["username"]
+                                            .as_str()
+                                            .or_else(|| d["user"]["username"].as_str())
+                                            .unwrap_or("user")
+                                            .to_string();
+
+                                        if !custom_id.is_empty() {
+                                            pending_interactions.lock().await.push(
+                                                ComponentInteraction {
+                                                    custom_id,
+                                                    message_id,
+                                                    channel_id,
+                                                    user_id,
+                                                    user_name,
+                                                },
+                                            );
+                                            // ACK so the click feels instant.
+                                            if !interaction_id.is_empty()
+                                                && !token.is_empty()
+                                            {
+                                                let client = reqwest::Client::new();
+                                                let url = format!(
+                                                    "{DISCORD_API_BASE}/interactions/{interaction_id}/{token}/callback"
+                                                );
+                                                let _ = client
+                                                    .post(&url)
+                                                    .json(&serde_json::json!({"type": 6}))
+                                                    .send()
+                                                    .await;
+                                            }
+                                            info!("Discord component click queued");
+                                        }
+                                    }
+                                }
+
                                 "RESUMED" => {
                                     info!("Discord session resumed successfully");
                                 }
@@ -831,6 +905,9 @@ impl ChannelAdapter for DiscordAdapter {
                     .await?;
             }
         }
+        // Remember where we last spoke so approval prompts land here.
+        *self.last_target.write().await =
+            Some((channel_id.clone(), String::new()));
         Ok(())
     }
 
@@ -904,6 +981,9 @@ impl ChannelAdapter for DiscordAdapter {
                     .await?;
             }
         }
+        // Prefer the thread for approval prompts (that's where the user is).
+        *self.last_target.write().await =
+            Some((channel_id.clone(), thread_id.to_string()));
         Ok(())
     }
 
@@ -971,6 +1051,105 @@ impl ChannelAdapter for DiscordAdapter {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let channel_id = thread_id.unwrap_or(&user.platform_id);
         self.api_delete_message(channel_id, message_id).await
+    }
+
+    // ------------------------------------------------------------------
+    // Interactive components (approval buttons)
+    // ------------------------------------------------------------------
+
+    fn supports_buttons(&self) -> bool {
+        true
+    }
+
+    async fn send_with_buttons(
+        &self,
+        user: &ChannelUser,
+        thread_id: Option<&str>,
+        text: &str,
+        buttons: Vec<ButtonSpec>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::types::split_message;
+        let channel_id = thread_id.unwrap_or(&user.platform_id);
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+
+        // Discord button styles: 1 primary, 2 secondary, 3 success, 4 danger.
+        let components: Vec<serde_json::Value> = buttons
+            .iter()
+            .map(|b| {
+                let style = match b.style.as_str() {
+                    "primary" => 1,
+                    "success" => 3,
+                    "danger" => 4,
+                    _ => 2,
+                };
+                serde_json::json!({
+                    "type": 2, // BUTTON
+                    "style": style,
+                    "label": b.label,
+                    "custom_id": b.custom_id,
+                })
+            })
+            .collect();
+
+        let body = serde_json::json!({
+            "content": split_message(text, DISCORD_MSG_LIMIT).join("\n"),
+            "components": [{
+                "type": 1, // ACTION_ROW
+                "components": components,
+            }],
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord sendWithButtons failed: {body_text}").into());
+        }
+        let value: serde_json::Value = resp.json().await?;
+        Ok(value["id"].as_str().unwrap_or_default().to_string())
+    }
+
+    async fn resolve_button_message(
+        &self,
+        user: &ChannelUser,
+        thread_id: Option<&str>,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let channel_id = thread_id.unwrap_or(&user.platform_id);
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        // Empty components array removes the buttons (can't be clicked twice).
+        let body = serde_json::json!({ "content": text, "components": [] });
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord resolveButtonMessage failed: {body_text}");
+        }
+        Ok(())
+    }
+
+    async fn last_target(&self) -> Option<(String, String)> {
+        self.last_target.read().await.clone()
+    }
+
+    async fn next_interaction(&self) -> Option<ComponentInteraction> {
+        let mut q = self.pending_interactions.lock().await;
+        if q.is_empty() {
+            None
+        } else {
+            Some(q.remove(0))
+        }
     }
 }
 

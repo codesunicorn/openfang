@@ -222,6 +222,28 @@ pub trait ChannelBridgeHandle: Send + Sync {
         Err("Not implemented".to_string())
     }
 
+    /// Where to post approval prompts for a channel type, as
+    /// `(channel_id, thread_id)` (empty thread = post in the channel).
+    ///
+    /// Approvals are not conversation-scoped (a tool call may be triggered by
+    /// any thread), so the handle tracks the most recent delivery target.
+    async fn channel_target_for_approvals(&self, _channel: &str) -> Option<(String, String)> {
+        None
+    }
+
+    /// Pending approval requests rendered as text (one per line).
+    async fn pending_approvals_text(&self) -> String {
+        String::new()
+    }
+
+    /// Pending approvals as structured `(request_id, human_summary)` pairs.
+    ///
+    /// Preferred over parsing `pending_approvals_text` — the button watcher
+    /// needs stable ids, not column-formatted output.
+    async fn pending_approvals_list(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Trigger LLM-based session compaction for an agent.
     async fn compact_session(&self, _agent_id: AgentId) -> Result<String, String> {
         Err("Not implemented".to_string())
@@ -555,6 +577,117 @@ impl BridgeManager {
         });
 
         self.tasks.push(task);
+
+        // Approval buttons: poll for pending approvals and for button clicks.
+        // Runs per adapter so prompts land in the channel that's watching.
+        if adapter.supports_buttons() {
+            let handle = self.handle.clone();
+            let adapter_btn = adapter.clone();
+            let mut shutdown_btn = self.shutdown_rx.clone();
+            let poll_task = tokio::spawn(async move {
+                let mut announced: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                // Last channel we posted prompts to (approvals aren't
+                // conversation-scoped, so reuse where the user last spoke).
+                let mut last_target: Option<(String, String)> = None;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        _ = shutdown_btn.changed() => {
+                            if *shutdown_btn.borrow() { break; }
+                            continue;
+                        }
+                    }
+
+                    // 1. Resolve clicks first (they're already ACKed by the adapter).
+                    while let Some(click) = adapter_btn.next_interaction().await {
+                        let (action, request_id) = match click.custom_id.split_once(':') {
+                            Some((a, id)) => (a.to_string(), id.to_string()),
+                            None => continue,
+                        };
+                        let approve = action == "approve";
+                        let result = handle
+                            .resolve_approval_text(&request_id, approve)
+                            .await;
+                        let user = ChannelUser {
+                            platform_id: click.channel_id.clone(),
+                            display_name: click.user_name.clone(),
+                            openfang_user: None,
+                        };
+                        let verdict = if approve { "approved" } else { "denied" };
+                        let line = format!(
+                            "**{verdict}** by {} — {result}",
+                            click.user_name
+                        );
+                        // Replace the buttons so it can't be clicked twice.
+                        let _ = adapter_btn
+                            .resolve_button_message(
+                                &user,
+                                None,
+                                &click.message_id,
+                                &line,
+                            )
+                            .await;
+                        announced.insert(request_id);
+                    }
+
+                    // 2. Post buttons for newly pending approvals.
+                    let pending = handle.pending_approvals_list().await;
+                    let new_ones: Vec<(String, String)> = pending
+                        .into_iter()
+                        .filter(|(id, _)| !announced.contains(id))
+                        .collect();
+                    if new_ones.is_empty() {
+                        continue;
+                    }
+                    let target = match adapter_btn.last_target().await {
+                        Some(t) => Some(t),
+                        None => last_target.clone(),
+                    };
+                    let Some((channel_id, thread_id)) = target else {
+                        continue;
+                    };
+                    last_target = Some((channel_id.clone(), thread_id.clone()));
+                    let user = ChannelUser {
+                        platform_id: channel_id.clone(),
+                        display_name: String::new(),
+                        openfang_user: None,
+                    };
+                    let thread_ref = if thread_id.is_empty() {
+                        None
+                    } else {
+                        Some(thread_id.as_str())
+                    };
+
+                    for (request_id, summary) in new_ones {
+                        let (ok_btn, deny_btn) =
+                            crate::types::ButtonSpec::approval_pair(&request_id);
+                        let text = format!(
+                            "🔐 **Approval required**\n\n{summary}\n\n\
+                             Approve this tool call?"
+                        );
+                        match adapter_btn
+                            .send_with_buttons(
+                                &user,
+                                thread_ref,
+                                &text,
+                                vec![ok_btn, deny_btn],
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                announced.insert(request_id);
+                            }
+                            Err(e) => {
+                                warn!("Failed to post approval buttons: {e}");
+                            }
+                        }
+                    }
+                }
+            });
+            self.tasks.push(poll_task);
+        }
+
         Ok(())
     }
 
@@ -751,6 +884,34 @@ const PREVIEW_EDIT_MIN_INTERVAL: Duration = Duration::from_millis(2_500);
 /// ticking instead of a frozen status line (hermes heartbeat parity).
 const PREVIEW_HEARTBEAT: Duration = Duration::from_millis(45_000);
 
+/// How often to post a "still working" note during a long silent turn.
+const PROGRESS_NOTE_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Build a mid-turn progress note listing what the agent has done so far.
+///
+/// Example: `⏳ still working · 2m 14s · 3 tools (file_read, web_fetch, web_search)`
+fn format_progress_note(recent: &[String], total: u32, start: Instant) -> String {
+    // Collapse duplicates, preserving order of last use.
+    let mut seen: Vec<String> = Vec::new();
+    for name in recent.iter().rev() {
+        if !seen.contains(name) {
+            seen.push(name.clone());
+        }
+        if seen.len() == 3 {
+            break;
+        }
+    }
+    seen.reverse();
+    let list = seen.join(", ");
+    format!(
+        "⏳ still working · {} · {} tool{} ({})",
+        fmt_elapsed(start),
+        total,
+        if total == 1 { "" } else { "s" },
+        list
+    )
+}
+
 /// Human elapsed time since `start`, hermes `formatLatency` style.
 fn fmt_elapsed(start: Instant) -> String {
     let secs = start.elapsed().as_secs();
@@ -818,6 +979,9 @@ async fn run_with_preview(
     let mut last_tool = String::new();
     let mut thinking = false;
     let mut last_edit = Instant::now();
+    // Recent tool names, for the periodic progress note.
+    let mut recent_tools: Vec<String> = Vec::new();
+    let mut last_progress_note = Instant::now();
 
     loop {
         let next = tokio::time::timeout(PREVIEW_HEARTBEAT, event_rx.recv()).await;
@@ -832,8 +996,12 @@ async fn run_with_preview(
                 }
                 crate::types::BridgeStreamEvent::ToolStart { name } => {
                     tool_count = tool_count.saturating_add(1);
-                    last_tool = name;
+                    last_tool = name.clone();
                     thinking = false;
+                    recent_tools.push(name);
+                    if recent_tools.len() > 6 {
+                        recent_tools.remove(0);
+                    }
                 }
                 crate::types::BridgeStreamEvent::ToolDone { .. } => {}
                 crate::types::BridgeStreamEvent::Complete => {}
@@ -842,6 +1010,26 @@ async fn run_with_preview(
             Ok(None) => break,
             // Heartbeat timeout: force an edit so elapsed time keeps ticking.
             Err(_) => {}
+        }
+
+        // Periodic progress note for genuinely long turns. Typing indicators
+        // and a ticking preview can't say WHAT is happening; a short note
+        // listing the tools used so far can ("3 pages fetched, 1 search").
+        // Only every 2 minutes, and only if no text is streaming yet (once the
+        // answer starts flowing, the preview speaks for itself).
+        if last_progress_note.elapsed() >= PROGRESS_NOTE_INTERVAL
+            && accumulated.trim().is_empty()
+            && !recent_tools.is_empty()
+        {
+            let note = format_progress_note(&recent_tools, tool_count, start);
+            let _ = adapter
+                .send_in_thread(
+                    &message.sender,
+                    ChannelContent::Text(note),
+                    thread_id.unwrap_or(&message.sender.platform_id),
+                )
+                .await;
+            last_progress_note = Instant::now();
         }
 
         if last_edit.elapsed() < PREVIEW_EDIT_MIN_INTERVAL {
@@ -3122,5 +3310,43 @@ mod tests {
             media_type_from_url("https://api.telegram.org/file/bot123/photos/file_42"),
             "image/jpeg"
         );
+    }
+
+    #[test]
+    fn test_format_progress_note_dedupes_and_caps() {
+        let start = Instant::now();
+        let tools = vec![
+            "web_search".to_string(),
+            "web_search".to_string(),
+            "file_read".to_string(),
+            "shell_exec".to_string(),
+            "agent_send".to_string(),
+        ];
+        let note = format_progress_note(&tools, 5, start);
+        assert!(note.starts_with("⏳ still working"), "got: {note}");
+        assert!(note.contains("5 tools"), "got: {note}");
+        // Only the 3 most recent distinct tools, in chronological order.
+        assert!(note.contains("file_read, shell_exec, agent_send"), "got: {note}");
+        assert!(!note.contains("web_search,"), "dupes/older dropped: {note}");
+    }
+
+    #[test]
+    fn test_format_progress_note_singular() {
+        let note = format_progress_note(&["web_fetch".to_string()], 1, Instant::now());
+        assert!(note.contains("1 tool ("), "got: {note}");
+        assert!(!note.contains("1 tools"), "got: {note}");
+    }
+
+    #[test]
+    fn test_approval_button_ids_roundtrip() {
+        let (ok, deny) = crate::types::ButtonSpec::approval_pair("abc-123");
+        assert_eq!(ok.custom_id, "approve:abc-123");
+        assert_eq!(deny.custom_id, "deny:abc-123");
+        assert_eq!(ok.style, "success");
+        assert_eq!(deny.style, "danger");
+        // Bridge parsing must recover the action + id.
+        let (action, id) = deny.custom_id.split_once(':').unwrap();
+        assert_eq!(action, "deny");
+        assert_eq!(id, "abc-123");
     }
 }
