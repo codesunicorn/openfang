@@ -209,6 +209,28 @@ pub struct LifecycleReaction {
     pub remove_previous: bool,
 }
 
+/// Bridge-level view of kernel streaming events (crate-neutral mirror of
+/// `openfang_runtime::llm_driver::StreamEvent`; the channels crate cannot
+/// depend on the runtime crate, so events are re-projected here by the
+/// api layer's `ChannelBridgeHandle` implementation).
+///
+/// Hermes/kimaki parity: consumed by the bridge to live-edit a preview
+/// message while the agent works.
+#[derive(Debug, Clone)]
+pub enum BridgeStreamEvent {
+    /// Incremental assistant text.
+    TextDelta { text: String },
+    /// Incremental reasoning/thinking text (content not required — the
+    /// preview only shows a "reasoning" status marker).
+    ThinkingDelta { text: String },
+    /// A tool call started.
+    ToolStart { name: String },
+    /// A tool call finished.
+    ToolDone { name: String, is_error: bool },
+    /// The LLM turn is complete (final response follows separately).
+    Complete,
+}
+
 /// Hardcoded emoji allowlist for lifecycle reactions.
 pub const ALLOWED_REACTION_EMOJI: &[&str] = &[
     "\u{1F914}",        // 🤔 thinking
@@ -366,6 +388,49 @@ pub trait ChannelAdapter: Send + Sync {
     /// logged regardless of this setting.
     fn suppress_error_responses(&self) -> bool {
         false
+    }
+
+    // ------------------------------------------------------------------
+    // Live streaming preview (hermes/kimaki parity)
+    // ------------------------------------------------------------------
+
+    /// Whether this adapter supports live-editing a preview message while
+    /// the agent works. Adapters that return `true` MUST implement
+    /// `preview_create`, `preview_edit`, and `preview_delete`.
+    fn supports_preview(&self) -> bool {
+        false
+    }
+
+    /// Create the preview message. Returns its platform message id.
+    /// `thread_id` is the thread to create it in (None → user's channel).
+    async fn preview_create(
+        &self,
+        _user: &ChannelUser,
+        _thread_id: Option<&str>,
+        _initial_text: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        Err("Preview not supported for this adapter".into())
+    }
+
+    /// Edit the preview message in place.
+    async fn preview_edit(
+        &self,
+        _user: &ChannelUser,
+        _thread_id: Option<&str>,
+        _message_id: &str,
+        _text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    /// Delete the preview message (end of turn: replaced by the final reply).
+    async fn preview_delete(
+        &self,
+        _user: &ChannelUser,
+        _thread_id: Option<&str>,
+        _message_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
     }
 }
 

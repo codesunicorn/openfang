@@ -102,6 +102,28 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
 
+    /// Streaming send with live preview support (hermes/kimaki parity).
+    ///
+    /// Streams `BridgeStreamEvent`s into `events` while the agent runs; resolves
+    /// to the final response with the same semantics as `send_message`
+    /// (empty string = silent/NO_REPLY). The default implementation falls back
+    /// to the blocking call and emits a single `Complete` event.
+    async fn send_message_streaming(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Option<Vec<ContentBlock>>,
+        events: tokio::sync::mpsc::Sender<crate::types::BridgeStreamEvent>,
+    ) -> Result<String, String> {
+        let _ = events
+            .send(crate::types::BridgeStreamEvent::Complete)
+            .await;
+        match blocks {
+            Some(b) => self.send_message_with_blocks(agent_id, b).await,
+            None => self.send_message(agent_id, message).await,
+        }
+    }
+
     /// Send a message with structured content blocks (text + images) to an agent.
     ///
     /// Default implementation extracts text from blocks and falls back to `send_message()`.
@@ -681,8 +703,158 @@ fn spawn_typing_loop(
     })
 }
 
-/// Extract the sender's user identity from a message.
+// ---------------------------------------------------------------------------
+// Live streaming preview (hermes/kimaki parity)
+// ---------------------------------------------------------------------------
+
+/// Preview text cap in bytes. Discord's limit is 2000; leave room for the
+/// status line and multibyte safety margin.
+const PREVIEW_TEXT_CAP: usize = 1_800;
+/// Minimum interval between preview edits (Discord edit rate limits + visual churn).
+const PREVIEW_EDIT_MIN_INTERVAL: Duration = Duration::from_millis(2_500);
+/// Re-edit the preview at least this often even with no events, so a silent
+/// multi-minute tool run (builds, test suites) still shows elapsed time
+/// ticking instead of a frozen status line (hermes heartbeat parity).
+const PREVIEW_HEARTBEAT: Duration = Duration::from_millis(45_000);
+
+/// Human elapsed time since `start`, hermes `formatLatency` style.
+fn fmt_elapsed(start: Instant) -> String {
+    let secs = start.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+/// Run an agent turn with a live-editing preview message.
 ///
+/// Creates a preview in the thread ("🤔 thinking · 0s"), streams the agent's
+/// text into it with a status line (✍️ writing / ⚙️ tool_name / 💭 reasoning +
+/// elapsed + tool count), re-edits every 45s as a liveness heartbeat, and
+/// deletes the preview when the turn ends — the caller's existing pipeline
+/// then delivers the final formatted reply (footer, chunking, prefix intact).
+///
+/// Falls back to the blocking call (no preview) if the adapter can't create one.
+async fn run_with_preview(
+    adapter: &Arc<dyn ChannelAdapter>,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    message: &ChannelMessage,
+    thread_id: Option<&str>,
+    agent_id: AgentId,
+    text: &str,
+    blocks: Option<Vec<ContentBlock>>,
+) -> Result<String, String> {
+    let start = Instant::now();
+
+    // 1. Create the preview message; on failure degrade gracefully.
+    //    (Stringify the error so the match scrutinee is Send — the `_` arm
+    //    awaits the blocking fallback while the match value is still alive.)
+    let preview_result: Result<String, String> = adapter
+        .preview_create(&message.sender, thread_id, "*🤔 thinking · 0s*")
+        .await
+        .map_err(|e| e.to_string());
+    let preview_id = match preview_result {
+        Ok(id) if !id.is_empty() => id,
+        _ => {
+            return match blocks {
+                Some(b) => handle.send_message_with_blocks(agent_id, b).await,
+                None => handle.send_message(agent_id, text).await,
+            };
+        }
+    };
+
+    // 2. Run the agent turn with streaming events.
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<crate::types::BridgeStreamEvent>(64);
+    let streaming_task = {
+        let handle = Arc::clone(handle);
+        let text = text.to_string();
+        tokio::spawn(async move {
+            handle
+                .send_message_streaming(agent_id, &text, blocks, event_tx)
+                .await
+        })
+    };
+
+    // 3. Live-edit the preview as events arrive (heartbeat when silent).
+    let mut accumulated = String::new();
+    let mut tool_count: u32 = 0;
+    let mut last_tool = String::new();
+    let mut thinking = false;
+    let mut last_edit = Instant::now();
+
+    loop {
+        let next = tokio::time::timeout(PREVIEW_HEARTBEAT, event_rx.recv()).await;
+        match next {
+            Ok(Some(ev)) => match ev {
+                crate::types::BridgeStreamEvent::TextDelta { text } => {
+                    thinking = false;
+                    accumulated.push_str(&text);
+                }
+                crate::types::BridgeStreamEvent::ThinkingDelta { .. } => {
+                    thinking = true;
+                }
+                crate::types::BridgeStreamEvent::ToolStart { name } => {
+                    tool_count = tool_count.saturating_add(1);
+                    last_tool = name;
+                    thinking = false;
+                }
+                crate::types::BridgeStreamEvent::ToolDone { .. } => {}
+                crate::types::BridgeStreamEvent::Complete => {}
+            },
+            // Channel closed: the turn is done — always do a final edit pass.
+            Ok(None) => break,
+            // Heartbeat timeout: force an edit so elapsed time keeps ticking.
+            Err(_) => {}
+        }
+
+        if last_edit.elapsed() < PREVIEW_EDIT_MIN_INTERVAL {
+            continue;
+        }
+
+        let head = if thinking {
+            "💭 reasoning".to_string()
+        } else if !last_tool.is_empty() {
+            format!("⚙️ {last_tool}")
+        } else if !accumulated.is_empty() {
+            "✍️ writing".to_string()
+        } else {
+            "🤔 thinking".to_string()
+        };
+        let tools = if tool_count > 0 {
+            format!(" · tool {tool_count}")
+        } else {
+            String::new()
+        };
+        let preview_text = openfang_types::truncate_str(&accumulated, PREVIEW_TEXT_CAP);
+        let display = if preview_text.is_empty() {
+            format!("*{head} · {}{tools}*", fmt_elapsed(start))
+        } else {
+            format!(
+                "{preview_text}\n\n*{head} · {}{tools}*",
+                fmt_elapsed(start)
+            )
+        };
+        let _ = adapter
+            .preview_edit(&message.sender, thread_id, &preview_id, &display)
+            .await;
+        last_edit = Instant::now();
+    }
+
+    // 4. Resolve the final response, remove the preview, hand back to the
+    //    caller's normal delivery pipeline (formatting/chunking unchanged).
+    let result = match streaming_task.await {
+        Ok(r) => r,
+        Err(e) => Err(format!("agent task failed: {e}")),
+    };
+    let _ = adapter
+        .preview_delete(&message.sender, thread_id, &preview_id)
+        .await;
+    result
+}
+
+/// Extract the sender's user identity from a message.
 /// Some adapters (e.g. Slack) set `platform_id` to the channel/conversation ID
 /// (needed for the send path) and store the actual user ID in metadata.
 /// This helper returns the user ID for RBAC and rate limiting.
@@ -1369,8 +1541,21 @@ async fn dispatch_message(
         text.clone()
     };
 
-    // Send to agent and relay response
-    let result = handle.send_message(agent_id, &prefixed_text).await;
+    // Send to agent and relay response (streaming preview when supported)
+    let result = if adapter_arc.supports_preview() {
+        run_with_preview(
+            &adapter_arc,
+            handle,
+            &message,
+            thread_id,
+            agent_id,
+            &prefixed_text,
+            None,
+        )
+        .await
+    } else {
+        handle.send_message(agent_id, &prefixed_text).await
+    };
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -1825,9 +2010,34 @@ async fn dispatch_with_blocks(
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), typing_user.clone());
 
-    let result = handle
-        .send_message_with_blocks(agent_id, blocks.clone())
-        .await;
+    // Streaming preview when supported (hermes/kimaki parity); falls back to
+    // the blocking blocks call otherwise.
+    let result = if adapter_arc.supports_preview() {
+        // Extract the text portion of the blocks for the message parameter
+        // (mirrors ChannelBridgeHandle::send_message_with_blocks default).
+        let blocks_text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        run_with_preview(
+            &adapter_arc,
+            handle,
+            &message,
+            thread_id,
+            agent_id,
+            &blocks_text,
+            Some(blocks.clone()),
+        )
+        .await
+    } else {
+        handle
+            .send_message_with_blocks(agent_id, blocks.clone())
+            .await
+    };
 
     typing_task.abort();
 

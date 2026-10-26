@@ -115,6 +115,61 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(self.kernel.registry.find_by_name(name).map(|e| e.id))
     }
 
+    /// Streaming send (hermes/kimaki parity): forwards kernel StreamEvents to
+    /// the bridge as BridgeStreamEvents while the agent runs, then resolves to
+    /// the final response. Mirrors the semantics of the blocking paths.
+    async fn send_message_streaming(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        events: tokio::sync::mpsc::Sender<openfang_channels::types::BridgeStreamEvent>,
+    ) -> Result<String, String> {
+        use openfang_channels::types::BridgeStreamEvent;
+        use openfang_runtime::llm_driver::StreamEvent;
+
+        // Capture before `blocks` is moved into the streaming call.
+        let blocks_param_is_none = blocks.is_none();
+        let (mut rx, jh) = self
+            .kernel
+            .send_message_streaming(agent_id, message, None, None, None, blocks)
+            .map_err(|e| format!("{e}"))?;
+
+        while let Some(ev) = rx.recv().await {
+            let mapped = match ev {
+                StreamEvent::TextDelta { text } => Some(BridgeStreamEvent::TextDelta { text }),
+                StreamEvent::ThinkingDelta { text } => {
+                    Some(BridgeStreamEvent::ThinkingDelta { text })
+                }
+                StreamEvent::ToolUseStart { name, .. } => {
+                    Some(BridgeStreamEvent::ToolStart { name })
+                }
+                StreamEvent::ToolExecutionResult {
+                    name, is_error, ..
+                } => Some(BridgeStreamEvent::ToolDone { name, is_error }),
+                StreamEvent::ContentComplete { .. } => Some(BridgeStreamEvent::Complete),
+                _ => None,
+            };
+            if let Some(m) = mapped {
+                let _ = events.send(m).await;
+            }
+        }
+
+        let result = jh
+            .await
+            .map_err(|e| format!("agent task failed: {e}"))?
+            .map_err(|e| format!("{e}"))?;
+
+        // Mirror the blocking paths: silent suppression applies to the
+        // text path (the blocks path historically does not check it).
+        // (`blocks` was moved into the streaming call above — capture first.)
+        let is_text_path = blocks_param_is_none;
+        if is_text_path && result.silent {
+            return Ok(String::new());
+        }
+        Ok(result.response)
+    }
+
     async fn list_agents(&self) -> Result<Vec<(AgentId, String)>, String> {
         Ok(self
             .kernel

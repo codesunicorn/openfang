@@ -171,6 +171,76 @@ impl DiscordAdapter {
         Ok(())
     }
 
+    /// Send a single message and return its message ID (used by previews —
+    /// previews must always fit one message, so no chunking here).
+    async fn api_send_message_returning_id(
+        &self,
+        channel_id: &str,
+        text: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let body = serde_json::json!({ "content": text });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord sendMessage failed: {body_text}").into());
+        }
+        let value: serde_json::Value = resp.json().await?;
+        Ok(value["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Edit an existing message in place (PATCH). Used by the streaming preview.
+    async fn api_edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let body = serde_json::json!({ "content": text });
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord editMessage failed: {body_text}");
+        }
+        Ok(())
+    }
+
+    /// Delete a message (used to clean up the preview when the final reply lands).
+    async fn api_delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord deleteMessage failed: {body_text}");
+        }
+        Ok(())
+    }
+
     /// Percent-encode a reaction emoji for use in a REST path segment.
     /// Discord expects unicode emoji URL-encoded (e.g. "🧵" → "%F0%9F%A7%B5").
     fn encode_reaction_emoji(emoji: &str) -> String {
@@ -858,6 +928,47 @@ impl ChannelAdapter for DiscordAdapter {
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Live streaming preview (hermes/kimaki parity)
+    // ------------------------------------------------------------------
+
+    fn supports_preview(&self) -> bool {
+        true
+    }
+
+    async fn preview_create(
+        &self,
+        user: &ChannelUser,
+        thread_id: Option<&str>,
+        initial_text: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Preview lives in the thread when one exists, else the channel.
+        let channel_id = thread_id.unwrap_or(&user.platform_id);
+        self.api_send_message_returning_id(channel_id, initial_text)
+            .await
+    }
+
+    async fn preview_edit(
+        &self,
+        user: &ChannelUser,
+        thread_id: Option<&str>,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let channel_id = thread_id.unwrap_or(&user.platform_id);
+        self.api_edit_message(channel_id, message_id, text).await
+    }
+
+    async fn preview_delete(
+        &self,
+        user: &ChannelUser,
+        thread_id: Option<&str>,
+        message_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let channel_id = thread_id.unwrap_or(&user.platform_id);
+        self.api_delete_message(channel_id, message_id).await
     }
 }
 
