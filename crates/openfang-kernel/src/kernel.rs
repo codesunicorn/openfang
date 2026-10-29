@@ -728,14 +728,17 @@ impl OpenFangKernel {
                             info!(
                                 provider = %provider,
                                 model = %model,
-                                "Auto-detected provider from {} — using as default",
+                                "Auto-detected provider from {} — added to driver chain",
                                 env_var
                             );
                             driver_chain.push(d);
-                            // Update the running config so agents get the right model
-                            config.default_model.provider = provider.to_string();
-                            config.default_model.model = model.to_string();
-                            config.default_model.api_key_env = env_var.to_string();
+                            // Do NOT rewrite `config.default_model` here. The salvage
+                            // driver enters the chain above, so runtime LLM calls
+                            // already use it. Mutating the operator's declared config
+                            // destroys catalog-alias references (provider "default" +
+                            // model "opus" -> anthropic, #1188) and makes
+                            // referenced_providers() report the salvage instead of
+                            // what was actually configured.
                         }
                         Err(e2) => {
                             warn!(provider = %provider, error = %e2, "Auto-detected provider also failed");
@@ -980,6 +983,14 @@ impl OpenFangKernel {
             use openfang_runtime::embedding::create_embedding_driver;
             let configured_model = &config.memory.embedding_model;
             if let Some(ref provider) = config.memory.embedding_provider {
+                // "none" / "disabled" opts out of vector embeddings entirely.
+                // Memory recall falls back to text search instead of retrying a
+                // doomed embedding API on every call (e.g. no usable embedding
+                // credentials on the machine).
+                if provider.eq_ignore_ascii_case("none") || provider.eq_ignore_ascii_case("disabled") {
+                    info!("Embeddings disabled via config — memory recall uses text search");
+                    None
+                } else {
                 // Explicit config takes priority — use the configured embedding model.
                 // If the user left embedding_model at the default ("all-MiniLM-L6-v2"),
                 // pick a sensible default for the chosen provider so we don't send a
@@ -1003,6 +1014,7 @@ impl OpenFangKernel {
                         warn!(provider = %provider, error = %e, "Embedding driver init failed — falling back to text search");
                         None
                     }
+                }
                 }
             } else {
                 // Auto-detect embedding provider by checking API key env vars in
@@ -7690,6 +7702,12 @@ impl KernelHandle for OpenFangKernel {
         self.approval_manager.requires_approval(tool_name)
     }
 
+    fn auto_approved_shell_command(&self, command: &str) -> bool {
+        self.approval_manager
+            .policy()
+            .shell_auto_approved(command)
+    }
+
     async fn request_approval(
         &self,
         agent_id: &str,
@@ -9528,5 +9546,33 @@ system_prompt = "You are a test agent."
         let contents = std::fs::read_to_string(user_workspace.path().join("pre-existing.txt"))
             .expect("read pre-existing");
         assert_eq!(contents, "hello", "must not overwrite user files");
+    }
+
+    // TEMPORARY scratch test for diagnosing the opus-alias failure. Remove me.
+    #[test]
+    fn scratch_opus_kernel_boot_debug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-scratch");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            default_model: openfang_types::config::DefaultModelConfig {
+                provider: "default".to_string(),
+                model: "opus".to_string(),
+                api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                base_url: None,
+                subprocess_timeout_secs: None,
+            },
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        let cfg_dm = &kernel.config.default_model;
+        eprintln!("SCRATCH config.default_model: provider={:?} model={:?}", cfg_dm.provider, cfg_dm.model);
+        let cat = kernel.model_catalog.read().unwrap();
+        eprintln!("SCRATCH find_model(opus): {:?}", cat.find_model("opus").map(|e| (e.id.clone(), e.provider.clone())));
+        drop(cat);
+        eprintln!("SCRATCH referenced: {:?}", kernel.referenced_providers());
+        kernel.shutdown();
     }
 }

@@ -66,6 +66,17 @@ impl AgentScheduler {
         self.usage.insert(agent_id, UsageTracker::default());
     }
 
+    /// Update an agent's quota without resetting the usage window.
+    ///
+    /// Unlike [`register`](Self::register), existing usage tracking is kept:
+    /// the tokens already consumed this hour keep counting against the new
+    /// limit. Used by the budget API so runtime enforcement
+    /// (`check_quota`) reflects updated limits immediately instead of only
+    /// after an agent restart.
+    pub fn update_quota(&self, agent_id: AgentId, quota: ResourceQuota) {
+        self.quotas.insert(agent_id, quota);
+    }
+
     /// Record token usage for an agent.
     pub fn record_usage(&self, agent_id: AgentId, usage: &TokenUsage) {
         if let Some(mut tracker) = self.usage.get_mut(&agent_id) {
@@ -187,5 +198,50 @@ mod tests {
             },
         );
         assert!(scheduler.check_quota(id).is_err());
+    }
+
+    #[test]
+    fn test_update_quota_takes_effect_immediately_without_resetting_usage() {
+        // The budget API flow: an agent blows through its limit, the operator
+        // raises the limit at runtime, and the very next message must pass —
+        // with prior usage still counted (no window reset).
+        let scheduler = AgentScheduler::new();
+        let id = AgentId::new();
+        let quota = ResourceQuota {
+            max_llm_tokens_per_hour: 100,
+            ..Default::default()
+        };
+        scheduler.register(id, quota);
+        scheduler.record_usage(
+            id,
+            &TokenUsage {
+                input_tokens: 60,
+                output_tokens: 50,
+            },
+        );
+        assert!(scheduler.check_quota(id).is_err()); // 110 / 100
+
+        // Raise the limit to 300: the already-consumed 110 must keep counting
+        // (get_usage unchanged), and check_quota must now pass.
+        scheduler.update_quota(
+            id,
+            ResourceQuota {
+                max_llm_tokens_per_hour: 300,
+                ..Default::default()
+            },
+        );
+        let (tokens, _) = scheduler.get_usage(id).unwrap();
+        assert_eq!(tokens, 110); // usage preserved, not reset
+        assert!(scheduler.check_quota(id).is_ok()); // 110 / 300
+
+        // Lowering below current usage must reject again — live enforcement.
+        scheduler.update_quota(
+            id,
+            ResourceQuota {
+                max_llm_tokens_per_hour: 50,
+                ..Default::default()
+            },
+        );
+        assert!(scheduler.check_quota(id).is_err()); // 110 / 50
     }
 }

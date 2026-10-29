@@ -132,6 +132,16 @@ pub trait KernelHandle: Send + Sync {
         false
     }
 
+    /// Check if a shell command matches the policy's `auto_approve_shell`
+    /// patterns (read-only exemption list) and may skip the approval prompt.
+    ///
+    /// Default: `false` — no exemptions. The kernel implements this by
+    /// consulting the live `[approval]` policy.
+    fn auto_approved_shell_command(&self, command: &str) -> bool {
+        let _ = command;
+        false
+    }
+
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
     /// Returns `Ok(true)` if approved, `Ok(false)` if denied or timed out.
     async fn request_approval(

@@ -343,6 +343,7 @@ Configures the SQLite-backed memory substrate, including vector embeddings and m
 ```toml
 [memory]
 # sqlite_path = "/custom/path/openfang.db"
+# embedding_provider = "openai"
 embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
@@ -351,9 +352,32 @@ decay_rate = 0.1
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `sqlite_path` | path or null | `null` | Explicit path to the SQLite database file. When `null`, defaults to `{data_dir}/openfang.db`. |
-| `embedding_model` | string | `"all-MiniLM-L6-v2"` | Model name used for generating vector embeddings for semantic memory search. |
+| `embedding_provider` | string or null | `null` | Explicit embedding provider. When `null`, the kernel auto-detects from available API keys (OPENAI, GROQ, MISTRAL, TOGETHER, FIREWORKS, COHERE), then local servers. Set to `"none"` (or `"disabled"`) to turn vector embeddings off entirely — semantic recall falls back to text search without retrying a doomed embedding API. |
+| `embedding_model` | string | `"all-MiniLM-L6-v2"` | Model name used for generating vector embeddings for semantic memory search. When an explicit `embedding_provider` is set and the model is left at the default, a sensible default for that provider is substituted (e.g. `text-embedding-3-small` for OpenAI). |
+| `embedding_api_key_env` | string | `null` | Env var holding the embedding API key. When unset, the provider's conventional key env (e.g. `OPENAI_API_KEY`) is used. |
 | `consolidation_threshold` | u64 | `10000` | Number of stored memories before automatic consolidation is triggered to merge and prune old entries. |
 | `decay_rate` | f32 | `0.1` | Memory confidence decay rate. `0.0` = no decay (memories never fade), `1.0` = aggressive decay. Values between 0.0 and 1.0. |
+
+---
+
+### `[approval]`
+
+Configures the execution-approval policy — tools listed here pause the agent and wait for a human decision before running (surfaced as buttons in chat channels or via the API/dashboard).
+
+```toml
+[approval]
+require_approval = ["shell_exec"]
+timeout_secs = 300
+auto_approve_shell = ["uptime", "df *", "free *"]
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `require_approval` | list of tools, or bool | `["shell_exec"]` | Tools that always require human approval. Boolean shorthand: `false` → no tools, `true` → `["shell_exec"]`. |
+| `timeout_secs` | u64 | `60` | How long to wait for a human decision before auto-denying. Range `10..=300`. Should be ≤ the agent's tool-execution timeout, or late approvals arrive after the tool call has already timed out. |
+| `auto_approve_shell` | list of patterns | `[]` | Shell commands that skip the approval prompt — intended for read-only diagnostics (`uptime`, `df *`, `free *`, `systemctl status *`). Patterns match the literal command: `"uptime"` = exact, `"df *"` = first-word. Chained/piped/redirected commands (`;`, `&&`, `\|\|`, `\|`, `>`, `<`, `` ` ``, `$(`) **never** auto-approve and always prompt. |
+| `auto_approve` | bool | `false` | Alias: when `true`, clears `require_approval` at boot (no tools prompt). |
+| `auto_approve_autonomous` | bool | `false` | Auto-approve tool calls made during autonomous (unscheduled-by-human) agent runs. |
 
 ---
 
@@ -1369,7 +1393,7 @@ usage_footer = "tokens"
 | Value | Description |
 |-------|-------------|
 | `all` | Respond to all messages in group chats. |
-| `mention_only` | Only respond when the bot is @mentioned (default). |
+| `mention_only` | Only respond when the bot is @mentioned (default). Messages inside a thread the bot is engaged in (e.g. Discord threads created by or replied into by the bot) count as implicit mentions. |
 | `commands_only` | Only respond to slash commands. |
 | `ignore` | Ignore all group messages. |
 

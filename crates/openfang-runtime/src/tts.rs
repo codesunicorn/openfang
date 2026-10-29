@@ -343,11 +343,20 @@ mod tests {
         let mut config = default_config();
         config.enabled = true;
         let engine = TtsEngine::new(config);
-        // This may or may not error depending on env vars
+        // Hermetic on keyless hosts only: with a provider key in the
+        // environment (e.g. a dev box with OPENAI_API_KEY), synthesize()
+        // selects a provider and attempts a real network call, so the error
+        // text is whatever the remote returns — not the "no provider"
+        // message this asserts on.
+        let keys_present = ["OPENAI_API_KEY", "ELEVENLABS_API_KEY"]
+            .iter()
+            .any(|k| std::env::var(k).is_ok());
         let result = engine.synthesize("Hello world", None, None).await;
         // If no API keys are set, should error
-        if let Err(err) = result {
-            assert!(err.contains("No TTS provider") || err.contains("not set"));
+        if !keys_present {
+            if let Err(err) = result {
+                assert!(err.contains("No TTS provider") || err.contains("not set"));
+            }
         }
     }
 

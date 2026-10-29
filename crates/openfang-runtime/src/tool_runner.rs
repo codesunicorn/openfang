@@ -164,7 +164,30 @@ pub async fn execute_tool(
     }
 
     if let Some(kh) = kernel {
-        if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
+        // Per-command approval exemption: the operator may list read-only
+        // shell commands ([approval] auto_approve_shell) that skip the human
+        // prompt — e.g. `uptime`, `df *`, `free *` — so scheduled monitoring
+        // agents don't spam approval buttons for non-destructive health
+        // checks. Patterns are matched against the literal command and never
+        // approve chained/piped commands (see ApprovalPolicy::shell_auto_approved).
+        let shell_auto_approved = !exec_policy_bypasses_approval
+            && is_shell_tool(tool_name)
+            && input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(|cmd| kh.auto_approved_shell_command(cmd));
+
+        if shell_auto_approved {
+            debug!(
+                tool_name,
+                "Approval exempt: command matches [approval].auto_approve_shell"
+            );
+        }
+
+        if !exec_policy_bypasses_approval
+            && !shell_auto_approved
+            && kh.requires_approval(tool_name)
+        {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
             let input_str = input.to_string();
             let summary = format!(

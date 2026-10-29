@@ -18,6 +18,9 @@ api_key_env = "ANTHROPIC_API_KEY"         # Environment variable holding API key
 [memory]
 decay_rate = 0.05                         # Memory confidence decay rate
 # sqlite_path = "~/.openfang/data/openfang.db"   # Optional: custom DB path
+# embedding_provider = "openai"           # Vector embeddings ("none"/"disabled" to turn off — recall uses text search)
+# embedding_model = "text-embedding-3-small"     # Model for embeddings (default: all-MiniLM-L6-v2)
+# embedding_api_key_env = "OPENAI_API_KEY"       # Env var holding the embedding API key
 
 [network]
 listen_addr = "127.0.0.1:4200"           # OFP listen address

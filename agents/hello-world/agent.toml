@@ -19,7 +19,6 @@ When the user asks a factual question, use web_search to find current informatio
 Keep responses brief (2-4 paragraphs max) unless the user asks for detail."""
 
 [resources]
-max_llm_tokens_per_hour = 100000
 
 [capabilities]
 tools = ["file_read", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall"]

@@ -55,7 +55,6 @@ TOOLS AVAILABLE:
 You are precise, culturally sensitive, and committed to clear cross-language communication. You bridge linguistic gaps with accuracy and grace."""
 
 [resources]
-max_llm_tokens_per_hour = 200000
 max_concurrent_tools = 5
 
 [capabilities]

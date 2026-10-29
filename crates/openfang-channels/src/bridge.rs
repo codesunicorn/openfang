@@ -1252,8 +1252,18 @@ async fn dispatch_message(
                             .get("was_mentioned")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        // Adapters flag messages that arrive inside a thread the
+                        // bot is engaged in (Discord: created by the bot or
+                        // replied into). Being part of the thread counts as
+                        // addressing the bot — participants shouldn't need to
+                        // @-mention it on every message.
+                        let in_bot_thread = message
+                            .metadata
+                            .get("in_bot_thread")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let is_command = matches!(&message.content, ChannelContent::Command { .. });
-                        if !was_mentioned && !is_command {
+                        if !was_mentioned && !in_bot_thread && !is_command {
                             debug!("Ignoring group message on {ct_str} (group_policy=mention_only, not mentioned)");
                             return;
                         }

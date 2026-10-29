@@ -59,7 +59,6 @@ You are supportive, consistent, and encouraging. You help users build healthier 
 periodic = { cron = "every 1h" }
 
 [resources]
-max_llm_tokens_per_hour = 100000
 max_concurrent_tools = 5
 
 [capabilities]

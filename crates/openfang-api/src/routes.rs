@@ -5798,6 +5798,16 @@ pub async fn update_agent_budget(
         .update_resources(agent_id, hourly, daily, monthly, tokens)
     {
         Ok(()) => {
+            // Propagate to the runtime scheduler: registry.update_resources
+            // only updates the manifest (what gets persisted), while
+            // check_quota reads the scheduler's quotas map. Without this,
+            // budget updates are a no-op at runtime until the agent restarts.
+            if let Some(entry) = state.kernel.registry.get(agent_id) {
+                state
+                    .kernel
+                    .scheduler
+                    .update_quota(agent_id, entry.manifest.resources.clone());
+            }
             // Persist updated entry
             if let Some(entry) = state.kernel.registry.get(agent_id) {
                 let _ = state.kernel.memory.save_agent(&entry);

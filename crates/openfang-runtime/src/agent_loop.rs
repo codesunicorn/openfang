@@ -41,10 +41,15 @@ const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 1000;
 
 /// Default timeout for individual tool executions (seconds).
+///
+/// Must be >= the approval window (`[approval] timeout_secs`, max 300) so a
+/// human can click an approval prompt before the tool call times out. A tool
+/// waiting on an approval that dies at 120s while the window is 300s makes
+/// every late click a guaranteed failure.
 /// Raised from 60s to 120s for browser automation and long-running builds.
 /// Overridable via `OPENFANG_TOOL_TIMEOUT_SECS` env var. Set to `0` to disable
 /// the timeout entirely (useful for slow local inference like vLLM on old GPUs).
-const TOOL_TIMEOUT_SECS: u64 = 120;
+const TOOL_TIMEOUT_SECS: u64 = 300;
 
 /// Default timeout for inter-agent tool calls (seconds).
 /// Agent delegation (agent_send, agent_spawn) can involve a full agent loop on the
@@ -3469,7 +3474,7 @@ mod tests {
 
     #[test]
     fn test_tool_timeout_constant() {
-        assert_eq!(TOOL_TIMEOUT_SECS, 120);
+        assert_eq!(TOOL_TIMEOUT_SECS, 300);
         assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 600);
     }
 
@@ -3492,11 +3497,11 @@ mod tests {
         );
         assert_eq!(
             tool_timeout_for("file_read"),
-            Some(Duration::from_secs(120))
+            Some(Duration::from_secs(300))
         );
         assert_eq!(
             tool_timeout_for("shell_exec"),
-            Some(Duration::from_secs(120))
+            Some(Duration::from_secs(300))
         );
 
         // Override: set to 0 → timeout disabled.
@@ -3527,7 +3532,7 @@ mod tests {
         );
         assert_eq!(
             tool_timeout_for("file_read"),
-            Some(Duration::from_secs(120))
+            Some(Duration::from_secs(300))
         );
 
         std::env::remove_var("OPENFANG_AGENT_TOOL_TIMEOUT_SECS");

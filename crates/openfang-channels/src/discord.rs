@@ -71,9 +71,17 @@ pub struct DiscordAdapter {
     session_id: Arc<RwLock<Option<String>>>,
     /// Resume gateway URL.
     resume_gateway_url: Arc<RwLock<Option<String>>>,
-    /// Thread channel IDs created by this bot (thread_id → parent_channel_id).
-    /// Used to detect when incoming messages are inside a bot-created thread.
+    /// Threads the bot is engaged in (thread_id → parent_channel_id). Seeded on
+    /// thread creation, on explicit sends into a thread, and by send-path
+    /// discovery (`classify_sent_channel`) for human-created threads.
+    /// Used to (a) route inbound messages inside these threads back into them
+    /// and (b) flag them `in_bot_thread` so the MentionOnly group policy lets
+    /// them through without an @mention on every message.
     created_thread_ids: Arc<RwLock<HashMap<String, String>>>,
+    /// Channel IDs whose Discord channel type has already been resolved via
+    /// GET /channels/{id} on the send path (thread discovery). Prevents
+    /// re-fetching the same channel on every outbound message.
+    checked_channel_ids: Arc<RwLock<HashSet<String>>>,
     /// Message IDs seen via MESSAGE_CREATE (used to drop duplicate MESSAGE_UPDATE events).
     /// Populated immediately when MESSAGE_CREATE is forwarded — before bridge processing —
     /// to eliminate the race window where MESSAGE_UPDATE arrives before thread creation completes.
@@ -114,6 +122,7 @@ impl DiscordAdapter {
             session_id: Arc::new(RwLock::new(None)),
             resume_gateway_url: Arc::new(RwLock::new(None)),
             created_thread_ids: Arc::new(RwLock::new(HashMap::new())),
+            checked_channel_ids: Arc::new(RwLock::new(HashSet::new())),
             threaded_message_ids: Arc::new(RwLock::new(HashSet::new())),
             last_reactions: Arc::new(RwLock::new(HashMap::new())),
             pending_interactions: Arc::new(Mutex::new(Vec::new())),
@@ -177,6 +186,10 @@ impl DiscordAdapter {
                 warn!("Discord sendMessage failed: {body_text}");
             }
         }
+        // Thread discovery: classify this channel once (cached) so replies
+        // into human-created threads are recognized on subsequent inbound
+        // messages. Best-effort — never fails the send.
+        self.classify_sent_channel(channel_id).await;
         Ok(())
     }
 
@@ -213,10 +226,10 @@ impl DiscordAdapter {
             return Err(format!("Discord sendMessage failed: {body_text}").into());
         }
         let value: serde_json::Value = resp.json().await?;
-        Ok(value["id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+        let message_id = value["id"].as_str().unwrap_or_default().to_string();
+        // Thread discovery: previews land in threads too (see api_send_message).
+        self.classify_sent_channel(channel_id).await;
+        Ok(message_id)
     }
 
     /// Edit an existing message in place (PATCH). Used by the streaming preview.
@@ -368,14 +381,99 @@ impl DiscordAdapter {
         Ok(thread_id)
     }
 
+    /// Record a thread the bot is engaged in (thread_id → parent_channel_id).
+    ///
+    /// The map doubles as the engagement set: any thread recorded here counts
+    /// as "the bot is part of this thread", so inbound messages inside it are
+    /// routed back into the thread and flagged `in_bot_thread` (which the
+    /// bridge's MentionOnly group policy treats as an implicit mention).
+    async fn note_engaged_thread(&self, thread_id: &str, parent_channel_id: &str) {
+        if thread_id.is_empty() || parent_channel_id.is_empty() {
+            return;
+        }
+        self.created_thread_ids
+            .write()
+            .await
+            .entry(thread_id.to_string())
+            .or_insert_with(|| parent_channel_id.to_string());
+    }
+
+    /// Classify a channel the bot just posted to (once per channel) so threads
+    /// it replies in — including human-created threads and threads created
+    /// before a daemon restart — are recognized on the inbound path.
+    ///
+    /// One `GET /channels/{id}` per unknown channel; the result is cached in
+    /// `checked_channel_ids`. Failures are silent and benign: an unclassified
+    /// channel simply keeps requiring @mentions until a later send succeeds.
+    async fn classify_sent_channel(&self, channel_id: &str) {
+        if channel_id.is_empty() {
+            return;
+        }
+        if self.created_thread_ids.read().await.contains_key(channel_id) {
+            return; // already a known thread
+        }
+        if self.checked_channel_ids.read().await.contains(channel_id) {
+            return; // already classified (regular channel or DM)
+        }
+        self.checked_channel_ids
+            .write()
+            .await
+            .insert(channel_id.to_string());
+
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}");
+        let resp = match self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Discord channel classification failed for {channel_id}: {e}");
+                return;
+            }
+        };
+        if !resp.status().is_success() {
+            debug!(
+                "Discord channel classification for {channel_id} returned HTTP {}",
+                resp.status()
+            );
+            return;
+        }
+        let value: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("Discord channel classification for {channel_id}: bad JSON: {e}");
+                return;
+            }
+        };
+        // Discord channel types: 10 = news thread, 11 = public thread,
+        // 12 = private thread.
+        let channel_type = value["type"].as_i64().unwrap_or(-1);
+        if (10..=12).contains(&channel_type) {
+            if let Some(parent) = value["parent_id"].as_str() {
+                debug!(
+                    "Discord: discovered bot engagement in thread {channel_id} (parent {parent})"
+                );
+                self.note_engaged_thread(channel_id, parent).await;
+            }
+        }
+    }
+
     /// Send a message to an existing thread.
     /// Discord threads are channels — post directly to channels/{thread_id}/messages.
     async fn api_send_thread_message(
         &self,
-        _channel_id: &str,
+        channel_id: &str,
         thread_id: &str,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Track thread_id → parent so later inbound messages inside this
+        // thread are recognized and answered without an @mention (the bot is
+        // part of this thread by construction).
+        self.note_engaged_thread(thread_id, channel_id).await;
+
         let url = format!("{DISCORD_API_BASE}/channels/{thread_id}/messages");
         let chunks = split_message_fenced(text, DISCORD_MSG_LIMIT);
 
@@ -1171,6 +1269,8 @@ impl ChannelAdapter for DiscordAdapter {
             return Err(format!("Discord sendWithButtons failed: {body_text}").into());
         }
         let value: serde_json::Value = resp.json().await?;
+        // Thread discovery (approval prompts can land in threads too).
+        self.classify_sent_channel(channel_id).await;
         Ok(value["id"].as_str().unwrap_or_default().to_string())
     }
 
@@ -1345,13 +1445,7 @@ async fn parse_discord_message(
             (channel_id.to_string(), None)
         }
     };
-    let username = author["username"].as_str().unwrap_or("Unknown");
-    let discriminator = author["discriminator"].as_str().unwrap_or("0000");
-    let display_name = if discriminator == "0" {
-        username.to_string()
-    } else {
-        format!("{username}#{discriminator}")
-    };
+    let display_name = discord_author_display_name(author);
 
     let timestamp = d["timestamp"]
         .as_str()
@@ -1445,6 +1539,61 @@ async fn parse_discord_message(
     // Stash the Discord author ID so the router can key bindings on user, not channel.
     // (`sender.platform_id` below is the channel ID, used for the send path.)
     metadata.insert("sender_user_id".to_string(), serde_json::json!(author_id));
+    // Inside a thread the bot is engaged in (created by the bot, or the bot
+    // has posted into it). The bridge's MentionOnly group policy treats this
+    // as an implicit mention — thread participants shouldn't have to
+    // @-mention the bot on every message.
+    if parsed_thread_id.is_some() {
+        metadata.insert("in_bot_thread".to_string(), serde_json::json!(true));
+    }
+
+    // Reply context: when the user replies to a message, Discord includes the
+    // parent in `referenced_message`. Prepend the quoted text so the agent
+    // knows what is being replied to (Telegram parity). The message ID is
+    // recorded in metadata even when the parent has no text (e.g. a
+    // sticker/attachment-only reply).
+    let content = match d.get("referenced_message").filter(|v| !v.is_null()) {
+        Some(reply_msg) => {
+            if let Some(reply_id) = reply_msg["id"].as_str() {
+                metadata.insert(
+                    "reply_to_message_id".to_string(),
+                    serde_json::json!(reply_id),
+                );
+            }
+            let quoted = reply_msg["content"].as_str().unwrap_or("").trim();
+            if quoted.is_empty() {
+                content
+            } else {
+                let reply_name = discord_author_display_name(&reply_msg["author"]);
+                let prefix = format!("[Replying to {reply_name}: {quoted}]\n\n");
+                match content {
+                    ChannelContent::Text(t) => ChannelContent::Text(format!("{prefix}{t}")),
+                    ChannelContent::Multipart(blocks) => {
+                        // Prepend to the first Text block (the caption, if any)
+                        // so the reply context reaches the agent.
+                        let mut prepended = false;
+                        ChannelContent::Multipart(
+                            blocks
+                                .into_iter()
+                                .map(|block| match block {
+                                    ChannelContent::Text(t) if !prepended => {
+                                        prepended = true;
+                                        ChannelContent::Text(format!("{prefix}{t}"))
+                                    }
+                                    other => other,
+                                })
+                                .collect(),
+                        )
+                    }
+                    // Commands keep their structure — reply context is not
+                    // injected into command args; downstream consumers can use
+                    // the `reply_to_message_id` metadata instead.
+                    other => other,
+                }
+            }
+        }
+        None => content,
+    };
 
     Some(ChannelMessage {
         channel: ChannelType::Discord,
@@ -1461,6 +1610,19 @@ async fn parse_discord_message(
         thread_id: parsed_thread_id,
         metadata,
     })
+}
+
+/// Resolve a Discord author JSON object to a display name.
+/// Modern accounts have discriminator "0" → bare username; legacy accounts
+/// keep the `username#discriminator` form.
+fn discord_author_display_name(author: &serde_json::Value) -> String {
+    let username = author["username"].as_str().unwrap_or("Unknown");
+    let discriminator = author["discriminator"].as_str().unwrap_or("0000");
+    if discriminator == "0" {
+        username.to_string()
+    } else {
+        format!("{username}#{discriminator}")
+    }
 }
 
 /// Build a Discord thread name from the message content.
@@ -2100,5 +2262,233 @@ mod tests {
         let d = payload_with("", vec![]);
         let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads()).await;
         assert!(msg.is_none());
+    }
+
+    // -- Reply context (`referenced_message`) tests ----------------------------
+
+    fn referenced_message(id: &str, username: &str, discriminator: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "author": {
+                "id": "user789",
+                "username": username,
+                "discriminator": discriminator
+            },
+            "content": content,
+            "timestamp": "2023-12-31T00:00:00+00:00"
+        })
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_reply_context_prepended() {
+        // When a user replies to a message, the quoted context should be
+        // prepended (Telegram parity) and the parent ID recorded in metadata.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let mut d = payload_with("I agree with that", vec![]);
+        d["referenced_message"] =
+            referenced_message("99", "bob", "0", "We should use Rust");
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match &msg.content {
+            ChannelContent::Text(t) => {
+                assert!(t.starts_with("[Replying to bob: We should use Rust]\n\n"));
+                assert!(t.ends_with("I agree with that"));
+            }
+            other => panic!("Expected Text, got {other:?}"),
+        }
+        assert_eq!(
+            msg.metadata
+                .get("reply_to_message_id")
+                .and_then(|v| v.as_str()),
+            Some("99")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_reply_context_legacy_username() {
+        // Legacy accounts keep the username#discriminator form in the prefix.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let mut d = payload_with("makes sense", vec![]);
+        d["referenced_message"] =
+            referenced_message("98", "carol", "1234", "Ship it Friday");
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match &msg.content {
+            ChannelContent::Text(t) => {
+                assert!(t.starts_with("[Replying to carol#1234: Ship it Friday]\n\n"));
+            }
+            other => panic!("Expected Text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_reply_null_referenced_message_no_context() {
+        // Discord can deliver `"referenced_message": null` — no prepend, no
+        // metadata.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let mut d = payload_with("hello", vec![]);
+        d["referenced_message"] = serde_json::Value::Null;
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        assert!(matches!(&msg.content, ChannelContent::Text(t) if t == "hello"));
+        assert!(!msg.metadata.contains_key("reply_to_message_id"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_reply_attachment_only_records_id_no_prepend() {
+        // A reply to a message with no text (sticker/attachment-only): the
+        // parent ID is still recorded, but nothing is prepended.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let mut d = payload_with("what is this", vec![]);
+        d["referenced_message"] = referenced_message("97", "dave", "0", "");
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        assert!(matches!(&msg.content, ChannelContent::Text(t) if t == "what is this"));
+        assert_eq!(
+            msg.metadata
+                .get("reply_to_message_id")
+                .and_then(|v| v.as_str()),
+            Some("97")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_reply_to_command_leaves_command_intact() {
+        // Commands keep their structure — reply context is not injected into
+        // command args; the parent ID is available via metadata instead.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let mut d = payload_with("/reset", vec![]);
+        d["referenced_message"] = referenced_message("96", "erin", "0", "old context");
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match &msg.content {
+            ChannelContent::Command { name, args } => {
+                assert_eq!(name, "reset");
+                assert!(args.is_empty());
+            }
+            other => panic!("Expected Command, got {other:?}"),
+        }
+        assert_eq!(
+            msg.metadata
+                .get("reply_to_message_id")
+                .and_then(|v| v.as_str()),
+            Some("96")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_reply_with_caption_prepends_to_multipart() {
+        // Caption + attachment replies: the prefix goes on the first Text
+        // block so the agent sees the reply context.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let mut d = payload_with(
+            "look at this",
+            vec![att("a.png", Some("image/png"), 10_000)],
+        );
+        d["referenced_message"] = referenced_message("95", "frank", "0", "the earlier screenshot");
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::Multipart(parts) => {
+                assert!(matches!(&parts[0], ChannelContent::Text(t)
+                    if t.starts_with("[Replying to frank: the earlier screenshot]\n\n")
+                        && t.ends_with("look at this")));
+                assert!(matches!(&parts[1], ChannelContent::Image { .. }));
+            }
+            other => panic!("Expected Multipart, got {other:?}"),
+        }
+    }
+
+    // -- In-bot-thread (implicit mention) tests --------------------------------
+
+    fn threads_with(thread_id: &str, parent: &str) -> Arc<RwLock<HashMap<String, String>>> {
+        Arc::new(RwLock::new(HashMap::from([(
+            thread_id.to_string(),
+            parent.to_string(),
+        )])))
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_message_in_bot_thread_sets_flag() {
+        // Messages inside a thread the bot is engaged in get `in_bot_thread`
+        // metadata (an implicit mention for the MentionOnly policy) and are
+        // routed back into the thread via the parent channel as platform_id.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "thread1",
+            "guild_id": "guild1",
+            "content": "continuing the conversation",
+            "author": {
+                "id": "user1",
+                "username": "alice",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &threads_with("thread1", "parent1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.thread_id.as_deref(), Some("thread1"));
+        // platform_id is the parent channel; the thread is addressed via thread_id.
+        assert_eq!(msg.sender.platform_id, "parent1");
+        assert_eq!(
+            msg.metadata.get("in_bot_thread").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // No mention was used — `was_mentioned` must NOT be set.
+        assert!(!msg.metadata.contains_key("was_mentioned"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_message_unknown_thread_no_flag() {
+        // A thread the bot has never engaged in is treated like a regular
+        // channel: no in_bot_thread flag, thread_id stays unset.
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "other_thread",
+            "guild_id": "guild1",
+            "content": "just chatting",
+            "author": {
+                "id": "user1",
+                "username": "alice",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            true,
+            &threads_with("thread1", "parent1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.thread_id, None);
+        assert!(!msg.metadata.contains_key("in_bot_thread"));
     }
 }

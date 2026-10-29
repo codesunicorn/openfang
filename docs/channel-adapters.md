@@ -232,7 +232,7 @@ Controls how the adapter handles messages in group chats, channels, and rooms:
 | GroupPolicy | Behavior |
 |-------------|----------|
 | `All` | Respond to every message in the group. |
-| `MentionOnly` | Only respond when the bot is @mentioned (default). |
+| `MentionOnly` | Only respond when the bot is @mentioned (default). Messages inside a thread the bot is engaged in (Discord) count as implicit mentions. |
 | `CommandsOnly` | Only respond to `/command` messages. |
 | `Ignore` | Silently ignore all group messages. |
 
@@ -347,6 +347,26 @@ default_agent = "coder"
 The Discord adapter connects to the Discord Gateway via WebSocket (v10). It listens for `MESSAGE_CREATE` events and routes messages to the configured agent. Responses are sent via the REST API's `channels/{id}/messages` endpoint.
 
 The adapter handles Gateway reconnection, heartbeating, and session resumption automatically.
+
+#### Threads and mentions
+
+Discord threads are channels, and the adapter keeps **one session per thread** so each thread has its own conversation history. A thread the bot is engaged in (created by the bot via `auto_thread`, or one the bot has replied into) is tracked as a known thread:
+
+- Messages inside a known thread are routed back into the same thread and flagged `in_bot_thread` metadata, which the `mention_only` group policy treats as an implicit mention — participants don't need to @-mention the bot on every message.
+- Threads the bot has never been part of stay mention-gated, so the bot doesn't jump into unrelated threads.
+- The bot classifies a channel once after posting into it (`GET /channels/{id}`, cached), so human-created threads — and threads created before a daemon restart — become known threads as soon as the bot replies there once.
+
+#### Reply context
+
+When a user replies to a message, Discord includes the parent in `referenced_message`. The adapter prepends the quoted parent to the message content:
+
+```
+[Replying to bob: We should use Rust]
+
+<the user's new message>
+```
+
+The parent message ID is also stored in `metadata["reply_to_message_id"]` (present even when the parent has no text, e.g. a sticker-only reply). Commands keep their argument structure — reply context is not injected into command args.
 
 ---
 

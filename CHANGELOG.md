@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[approval] auto_approve_shell` — per-command approval exemptions for read-only shell commands (`"uptime"`, `"df *"`, `"free *"`, `"systemctl status *"`...). Matching commands run without a human prompt; chained/piped/redirected commands (`;`, `&&`, `||`, `|`, `>`, `<`, `` ` ``, `$(`) never auto-approve and always prompt. Intended for scheduled monitoring agents that otherwise spam approval buttons for non-destructive health checks. Empty by default.
+- `[memory] embedding_provider = "none"` (or `"disabled"`) explicitly turns off vector embeddings — recall falls back to text search instead of retrying a doomed embedding API (e.g. no embedding credentials on the machine) on every call. `[memory]` embedding settings documented in configuration.md along with a new `[approval]` section.
+- Discord: threads the bot is engaged in no longer require an @mention on every message. Messages inside a known thread (created by the bot, replied into by the bot, or discovered on the send path) are flagged `in_bot_thread` and pass the `mention_only` group policy automatically. Each channel the bot posts to is classified once via `GET /channels/{id}` (cached), so human-created threads — and threads created before a daemon restart — become auto-engaged once the bot replies there. Threads the bot has never been part of stay mention-gated.
+- Discord: replies now carry reply context. The replied-to message is prepended to the prompt (`[Replying to <name>: <text>]`, Telegram parity), and `reply_to_message_id` is recorded in message metadata — including for parents with no text (sticker/attachment-only). Commands keep their argument structure.
+
 ### Fixed
 
 - Discord approval buttons now acknowledge instantly with interaction type 7 (UPDATE_MESSAGE): the prompt is replaced in place and the buttons removed on tap — no more "tap twice" or re-clicking the same prompt. Verdict lines keep the original prompt text (component interactions now carry `message_content`), verdict latency dropped 5s → 2s, and clicking an expired prompt replies "That approval expired (window: Ns) or was already decided." instead of implying the id was wrong.
+- Kernel boot no longer rewrites `default_model` when auto-detecting a provider. When the primary driver init failed, the salvage path built the driver chain AND silently overwrote the operator's declared `provider`/`model` with the detected provider's defaults (e.g. `provider="default"`, `model="opus"` became `openai`/`gpt-4o` whenever `OPENAI_API_KEY` was set) — destroying catalog-alias references (#1188) and making `referenced_providers()` report the salvage instead of the configuration. The salvage driver still enters the chain (runtime behavior unchanged); the declared config stays intact.
+- `PUT /api/budget/agents/{id}` now takes effect at runtime immediately. Previously it updated the registry manifest (and persisted it) but never propagated to the scheduler's quota map that `check_quota` reads, so budget changes were silently a no-op until the agent restarted. Usage already consumed this window is preserved (no reset).
+- Bundled agent manifests no longer ship `max_llm_tokens_per_hour` (values ranged 50K–500K). One multi-tool turn can consume 140K+ input tokens, so the previous limits silenced agents after a handful of messages for up to an hour. Absent field = unlimited; `[budget] default_max_llm_tokens_per_hour` in config.toml still overrides when set.
+- Default tool-execution timeout raised from 120s to 300s (`OPENFANG_TOOL_TIMEOUT_SECS` still overrides; `0` disables). The old default was shorter than the maximum approval window (`[approval] timeout_secs`, capped at 300s), so every approval click made between 2 and 5 minutes guaranteed a tool timeout.
+
+### Changed
+
+- OpenAI-compatible driver now enforces an LLM request deadline (default 300s, env `OPENFANG_LLM_REQUEST_TIMEOUT_SECS`, `0` disables): a 30s connect timeout, an idle-read timeout on streams, and a per-request total timeout on non-streaming completions. A wedged upstream now fails the attempt and retries instead of pinning the agent turn (and the user's "thinking" preview) indefinitely.
 
 ## [0.5.10] - 2026-04-17
 

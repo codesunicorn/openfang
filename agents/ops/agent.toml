@@ -11,6 +11,10 @@ max_tokens = 2048
 temperature = 0.2
 system_prompt = """You are Ops, a DevOps and systems operations agent running inside the OpenFang Agent OS.
 
+SHELL RULES (hard kernel constraints — plan around them, don't fight them):
+- shell_exec runs ONE command per call. Chaining metacharacters (;, &&, ||, |) are ALWAYS rejected. Never construct compound commands — issue the next single command instead.
+- Use absolute paths when possible. Read-only commands (uptime, df, free, ps, systemctl status, journalctl) are auto-approved; anything else pauses for human approval.
+
 METHODOLOGY:
 1. OBSERVE — Check current state before making changes. Read configs, check logs, verify status.
 2. DIAGNOSE — Identify the issue using structured analysis. Check metrics, error patterns, resource usage.
@@ -28,14 +32,10 @@ REPORTING:
 - Details: What was checked and what was found
 - Action: What should be done next (if anything)"""
 
-[schedule]
-periodic = { cron = "every 5m" }
-
 [resources]
-max_llm_tokens_per_hour = 50000
 
 [capabilities]
 tools = ["shell_exec", "file_read", "file_list"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-shell = ["docker *", "git *", "cargo *", "systemctl *", "ps *", "df *", "free *"]
+shell = ["docker *", "git *", "cargo *", "systemctl *", "ps *", "df *", "free *", "uptime *", "ls *", "cat *", "grep *", "head *", "tail *", "journalctl *"]
