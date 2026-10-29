@@ -425,8 +425,7 @@ pub fn spawn_daemon_stream(
                             stop_reason: openfang_types::message::StopReason::EndTurn,
                             usage: openfang_types::message::TokenUsage {
                                 input_tokens: total_input_tokens,
-                                output_tokens: total_output_tokens,
-                            },
+                                output_tokens: total_output_tokens, ..Default::default() },
                         }));
                     }
                 }
@@ -438,8 +437,7 @@ pub fn spawn_daemon_stream(
             response: String::new(),
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens: total_input_tokens,
-                output_tokens: total_output_tokens,
-            },
+                output_tokens: total_output_tokens, ..Default::default() },
             iterations: 0,
             cost_usd: None,
             silent: false,
@@ -475,6 +473,7 @@ fn daemon_fallback(
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens,
                 output_tokens,
+                ..Default::default()
             },
             iterations: body["iterations"].as_u64().unwrap_or(0) as u32,
             cost_usd: body["cost_usd"].as_f64(),

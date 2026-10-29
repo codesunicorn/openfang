@@ -14,10 +14,18 @@ pub struct UsageRecord {
     pub agent_id: AgentId,
     /// Model used.
     pub model: String,
-    /// Input tokens consumed.
+    /// Input tokens consumed (includes cached tokens — see below).
     pub input_tokens: u64,
     /// Output tokens consumed.
     pub output_tokens: u64,
+    /// Input tokens served from the provider prompt cache (subset of
+    /// `input_tokens`), for cost analytics.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Input tokens written to the provider prompt cache (subset of
+    /// `input_tokens`).
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     /// Estimated cost in USD.
     pub cost_usd: f64,
     /// Number of tool calls in this interaction.
@@ -88,8 +96,8 @@ impl UsageStore {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO usage_events (id, agent_id, timestamp, model, input_tokens, output_tokens, cost_usd, tool_calls)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO usage_events (id, agent_id, timestamp, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, tool_calls)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 id,
                 record.agent_id.0.to_string(),
@@ -97,6 +105,8 @@ impl UsageStore {
                 record.model,
                 record.input_tokens as i64,
                 record.output_tokens as i64,
+                record.cache_read_tokens as i64,
+                record.cache_creation_tokens as i64,
                 record.cost_usd,
                 record.tool_calls as i64,
             ],
@@ -373,6 +383,8 @@ mod tests {
                 model: "claude-haiku".to_string(),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.001,
                 tool_calls: 2,
             })
@@ -384,6 +396,8 @@ mod tests {
                 model: "claude-sonnet".to_string(),
                 input_tokens: 500,
                 output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.01,
                 tool_calls: 1,
             })
@@ -409,6 +423,8 @@ mod tests {
                 model: "haiku".to_string(),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.001,
                 tool_calls: 0,
             })
@@ -420,6 +436,8 @@ mod tests {
                 model: "sonnet".to_string(),
                 input_tokens: 200,
                 output_tokens: 100,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.005,
                 tool_calls: 1,
             })
@@ -442,6 +460,8 @@ mod tests {
                     model: "haiku".to_string(),
                     input_tokens: 100,
                     output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                     cost_usd: 0.001,
                     tool_calls: 0,
                 })
@@ -454,6 +474,8 @@ mod tests {
                 model: "sonnet".to_string(),
                 input_tokens: 500,
                 output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.01,
                 tool_calls: 1,
             })
@@ -478,6 +500,8 @@ mod tests {
                 model: "haiku".to_string(),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.05,
                 tool_calls: 0,
             })
@@ -498,6 +522,8 @@ mod tests {
                 model: "haiku".to_string(),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.123,
                 tool_calls: 0,
             })
@@ -518,6 +544,8 @@ mod tests {
                 model: "haiku".to_string(),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.001,
                 tool_calls: 0,
             })

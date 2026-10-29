@@ -688,3 +688,8 @@ mod tests {
         assert_eq!(result["properties"]["tags"]["nullable"], true);
     }
 }
+
+/// Human/LLM-facing list of tools callable from inside `code_execute`
+/// scripts via `call_tool(...)`.
+pub const NESTED_TOOLS_HINT: &str =
+    "file_read, file_write, file_list, memory_recall, memory_store, session_search, web_fetch, web_search";

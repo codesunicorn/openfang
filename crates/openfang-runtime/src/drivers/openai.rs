@@ -16,41 +16,6 @@ use zeroize::Zeroizing;
 /// Azure OpenAI API version query parameter.
 const AZURE_API_VERSION: &str = "2024-10-21";
 
-/// Total deadline for a single LLM HTTP request, in seconds.
-///
-/// Without a deadline, a wedged upstream (proxy hang, TLS stall, black-holed
-/// connection) pins the agent turn forever — the user sees a stuck "thinking"
-/// preview that never resolves. Env-overridable via
-/// `OPENFANG_LLM_REQUEST_TIMEOUT_SECS`; `0` disables the deadline (old behavior).
-const LLM_REQUEST_TIMEOUT_SECS: u64 = 300;
-
-/// The LLM request deadline, or `None` when disabled via env.
-fn llm_request_timeout() -> Option<std::time::Duration> {
-    let secs = std::env::var("OPENFANG_LLM_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(LLM_REQUEST_TIMEOUT_SECS);
-    if secs == 0 {
-        None
-    } else {
-        Some(std::time::Duration::from_secs(secs))
-    }
-}
-
-/// Build the shared HTTP client with connection + idle-read deadlines.
-///
-/// `read_timeout` bounds how long a stream may sit without bytes (wedged SSE)
-/// and how long a non-streaming response may take to produce its first byte.
-fn build_llm_http_client() -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
-        .user_agent(crate::USER_AGENT)
-        .connect_timeout(std::time::Duration::from_secs(30));
-    if let Some(idle) = llm_request_timeout() {
-        builder = builder.read_timeout(idle);
-    }
-    builder.build().unwrap_or_default()
-}
-
 /// OpenAI-compatible API driver.
 pub struct OpenAIDriver {
     api_key: Zeroizing<String>,
@@ -67,7 +32,7 @@ impl OpenAIDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: build_llm_http_client(),
+            client: crate::drivers::build_llm_http_client(),
             extra_headers: Vec::new(),
             azure_mode: false,
         }
@@ -82,7 +47,7 @@ impl OpenAIDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: build_llm_http_client(),
+            client: crate::drivers::build_llm_http_client(),
             extra_headers: Vec::new(),
             azure_mode: true,
         }
@@ -320,6 +285,16 @@ impl OaiResponseMessage {
 struct OaiUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// OpenAI-compatible providers (OpenAI, Groq, vLLM, Together, ...)
+    /// report cached prefix tokens here: prompt_tokens_details.cached_tokens.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 /// Strip trailing empty assistant messages without tool calls.
@@ -654,7 +629,7 @@ impl LlmDriver for OpenAIDriver {
             // Total deadline per attempt: a wedged upstream fails fast here
             // (recoverable, retried below) instead of hanging the turn forever.
             let mut req_builder = req_builder;
-            if let Some(total) = llm_request_timeout() {
+            if let Some(total) = crate::drivers::llm_request_timeout() {
                 req_builder = req_builder.timeout(total);
             }
 
@@ -908,6 +883,13 @@ impl LlmDriver for OpenAIDriver {
                 .map(|u| TokenUsage {
                     input_tokens: u.prompt_tokens,
                     output_tokens: u.completion_tokens,
+                    // cached_tokens is a subset of prompt_tokens on the
+                    // OpenAI-compatible wire format.
+                    cache_read_tokens: u
+                        .prompt_tokens_details
+                        .and_then(|d| d.cached_tokens)
+                        .unwrap_or(0),
+                    ..Default::default()
                 })
                 .unwrap_or_default();
 
@@ -1261,6 +1243,11 @@ impl LlmDriver for OpenAIDriver {
                         }
                         if let Some(ct) = u["completion_tokens"].as_u64() {
                             usage.output_tokens = ct;
+                        }
+                        if let Some(c) =
+                            u["prompt_tokens_details"]["cached_tokens"].as_u64()
+                        {
+                            usage.cache_read_tokens = c;
                         }
                     }
 
@@ -1719,8 +1706,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage {
                     input_tokens: 0,
-                    output_tokens: 0,
-                },
+                    output_tokens: 0, ..Default::default() },
             });
         }
         return None;
@@ -1732,8 +1718,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
         stop_reason: StopReason::ToolUse,
         usage: TokenUsage {
             input_tokens: 0,
-            output_tokens: 0,
-        },
+            output_tokens: 0, ..Default::default() },
     })
 }
 

@@ -267,6 +267,27 @@ pub async fn execute_tool(
         "shell_exec" => {
             let command = input["command"].as_str().unwrap_or("");
 
+            // SECURITY: Hard-deny floor ([approval] deny_shell) fires FIRST —
+            // before metachar checks, exec_policy bypass, auto-approve
+            // exemptions and the approval gate. This is the floor that
+            // cannot be bypassed by any later configuration. Pattern
+            // matching runs on the deobfuscated command, so quoting tricks
+            // (`r\m`, `st""us`) do not slip past it.
+            if let Some(kh) = kernel {
+                if kh.shell_denied(command) {
+                    warn!(
+                        command = crate::str_utils::safe_truncate_str(command, 120),
+                        "shell_exec blocked by [approval].deny_shell hard floor"
+                    );
+                    return ToolResult {
+                        tool_use_id: tool_use_id.to_string(),
+                        content: "[approval].deny_shell hard floor. This command can never run through shell_exec on this instance — no approval, exemption or exec policy can override it."
+                            .to_string(),
+                        is_error: true,
+                    };
+                }
+            }
+
             // SECURITY: Always check for shell metacharacters, even in Full mode.
             // These enable command injection regardless of exec policy.
             if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command)
@@ -328,6 +349,7 @@ pub async fn execute_tool(
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
+        "session_search" => tool_session_search(input, kernel),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -500,6 +522,14 @@ pub async fn execute_tool(
                 Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
             }
         },
+
+        // Channel directory: resolve human channel names to platform ids.
+        "channel_directory" => tool_channel_directory(input, kernel),
+
+        // Persistent Python code kernel (single-turn multi-tool scripting).
+        "code_execute" => {
+            tool_code_execute(input, kernel, caller_agent_id).await
+        }
 
         // Skill introspection tools (issue #1038)
         "skill_list" => tool_skill_list(skill_registry),
@@ -775,6 +805,18 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "key": { "type": "string", "description": "The storage key to recall" }
                 },
                 "required": ["key"]
+            }),
+        },
+        ToolDefinition {
+            name: "session_search".to_string(),
+            description: "Full-text search over past conversations (all sessions, all agents). Use before asking the user to re-explain something, or to answer 'what did we say about X?'. Returns bm25-ranked quotes with dates and session labels.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search terms (FTS5 syntax: words, \"quoted phrases\", OR)" },
+                    "limit": { "type": "integer", "description": "Max hits to return (1-20, default 5)" }
+                },
+                "required": ["query"]
             }),
         },
         // --- Collaboration tools ---
@@ -1340,6 +1382,34 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // These let the agent discover and read installed skills without
         // touching the filesystem. Global skills live at ~/.openfang/skills/
         // which is outside the workspace sandbox — file_read cannot reach them.
+        ToolDefinition {
+            name: "channel_directory".to_string(),
+            description: "List chat channels the bot is known to reach, with human names → platform ids. Use this before channel_send when the user names a destination (\"post it in #taau\") instead of giving an id.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Optional adapter filter: discord, telegram, slack, matrix..." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "code_execute".to_string(),
+            description: format!(
+                "Run Python in a persistent per-agent interpreter. Use it to collapse multi-step work into ONE call: loop over items, parse/aggregate tool output, or compute results locally instead of making one tool call per assistant turn. \"\
+                 State (variables, imports, functions) persists between calls. \"\
+                 Inside the script call tools with call_tool(name, **kwargs) — available: {}. \"\
+                 stdout is returned; exceptions come back as an [error] block and do NOT kill the interpreter. \"\
+                 Prefer this over many sequential tool calls when a task needs >2 tool invocations or any bulk/aggregation logic.",
+                openfang_types::tool::NESTED_TOOLS_HINT
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "description": "Python source. Use call_tool('file_read', path='...') etc. to call OpenFang tools." }
+                },
+                "required": ["code"]
+            }),
+        },
         ToolDefinition {
             name: "skill_list".to_string(),
             description: "List all installed skills available to this agent. Returns name, version, description, runtime type, and provided tool names. Use this instead of file_list on the skills directory.".to_string(),
@@ -1917,6 +1987,41 @@ fn tool_memory_recall(
         Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
         None => Ok(format!("No value found for key '{key}'.")),
     }
+}
+
+/// Full-text search over past conversations (all sessions, all agents).
+/// Lets the agent answer "what did we decide about X back in October?"
+/// without the user re-explaining.
+fn tool_session_search(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let query = input["query"].as_str().ok_or("Missing 'query' parameter")?;
+    let limit = input["limit"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
+    let hits = kh.session_search(query, limit);
+    if hits.is_empty() {
+        return Ok(format!(
+            "No past conversation matches '{query}'."
+        ));
+    }
+    let mut out = String::from("Past conversation matches (best first):\n");
+    for h in &hits {
+        let when = h["created_at"].as_str().unwrap_or("unknown time");
+        let label = h["session_label"].as_str().unwrap_or("session");
+        let role = h["role"].as_str().unwrap_or("?");
+        let content = h["content"].as_str().unwrap_or("");
+        let snippet: String = if content.chars().count() > 400 {
+            let cut: String = content.chars().take(400).collect();
+            format!("{cut}...")
+        } else {
+            content.to_string()
+        };
+        out.push_str(&format!(
+            "- [{when}] {label} · {role}: {snippet}\n"
+        ));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -3610,7 +3715,46 @@ async fn tool_canvas_present(
 // already-loaded skill registry directly to the agent.
 // ---------------------------------------------------------------------------
 
-/// List all skills available to this agent, with their provided tool names.
+/// List known chat channels (name → id), so `channel_send` can be given a
+/// human name like "#taau" instead of requiring the operator to paste ids.
+fn tool_channel_directory(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let filter = input["channel"].as_str().filter(|s| !s.trim().is_empty());
+    let rendered = kh.channel_directory(filter);
+    if rendered.trim().is_empty() {
+        Ok("No channels known yet.".to_string())
+    } else {
+        Ok(rendered)
+    }
+}
+
+/// Execute Python in the agent's persistent code kernel.
+///
+/// The script can call `call_tool(name, **kwargs)` to invoke file/memory/web
+/// tools and process their results inline — collapsing a multi-step tool loop
+/// (N LLM round-trips, each re-sending the whole conversation) into one turn.
+async fn tool_code_execute(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let code = input["code"]
+        .as_str()
+        .ok_or("Missing 'code' parameter (Python source)")?;
+    if code.trim().is_empty() {
+        return Err("'code' is empty".to_string());
+    }
+    let agent_id = caller_agent_id.ok_or("code_execute requires a caller agent")?;
+    // Session key: one interpreter per agent, so variables persist between
+    // calls. Subagents get their own agent id, hence their own interpreter.
+    let session_key = format!("agent:{agent_id}");
+    kh.code_execute(agent_id, &session_key, code).await
+}
+
 fn tool_skill_list(skill_registry: Option<&SkillRegistry>) -> Result<String, String> {
     let registry = match skill_registry {
         Some(r) => r,

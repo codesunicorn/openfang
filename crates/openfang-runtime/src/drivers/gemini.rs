@@ -32,10 +32,7 @@ impl GeminiDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: reqwest::Client::builder()
-                .user_agent(crate::USER_AGENT)
-                .build()
-                .unwrap_or_default(),
+            client: crate::drivers::build_llm_http_client(),
         }
     }
 }
@@ -648,8 +645,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         .usage_metadata
         .map(|u| TokenUsage {
             input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
-        })
+            output_tokens: u.candidates_token_count, ..Default::default() })
         .unwrap_or_default();
 
     Ok(CompletionResponse {

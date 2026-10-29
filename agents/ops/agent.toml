@@ -35,7 +35,7 @@ REPORTING:
 [resources]
 
 [capabilities]
-tools = ["shell_exec", "file_read", "file_list"]
+tools = ["shell_exec", "file_read", "file_list", "code_execute"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 shell = ["docker *", "git *", "cargo *", "systemctl *", "ps *", "df *", "free *", "uptime *", "ls *", "cat *", "grep *", "head *", "tail *", "journalctl *"]

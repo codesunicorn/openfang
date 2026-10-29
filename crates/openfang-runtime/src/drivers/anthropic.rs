@@ -27,10 +27,7 @@ impl AnthropicDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: reqwest::Client::builder()
-                .user_agent(crate::USER_AGENT)
-                .build()
-                .unwrap_or_default(),
+            client: crate::drivers::build_llm_http_client(),
         }
     }
 }
@@ -40,8 +37,11 @@ impl AnthropicDriver {
 struct ApiRequest {
     model: String,
     max_tokens: u32,
+    /// System prompt as a single text block carrying an `ephemeral`
+    /// cache_control breakpoint — Anthropic caches everything up to the last
+    /// breakpoint, so marker placement = [system, last tool].
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<serde_json::Value>,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiTool>,
@@ -115,6 +115,9 @@ struct ApiTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    /// Prompt-cache breakpoint on the last tool entry (see build_api_tools).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 /// Anthropic Messages API response body.
@@ -157,6 +160,48 @@ enum ResponseContentBlock {
 struct ApiUsage {
     input_tokens: u64,
     output_tokens: u64,
+    /// Tokens served from the prompt cache (billed at ~10% of input price).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    /// Tokens written to the prompt cache this request (5m TTL: 1.25x).
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
+
+/// Build tool definitions with a prompt-cache breakpoint on the last entry.
+///
+/// Anthropic caches the prefix up to (and including) the last
+/// `cache_control` marker. Marking the final tool means tools + system are
+/// cached as one stable prefix; the volatile message history follows and
+/// misses the cache only where it actually changed.
+fn build_api_tools(tools: &[openfang_types::tool::ToolDefinition]) -> Vec<ApiTool> {
+    let n = tools.len();
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ApiTool {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+            cache_control: if i + 1 == n && n > 1 {
+                Some(serde_json::json!({"type": "ephemeral"}))
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
+/// Wrap the system prompt as a cached text block (see `build_api_tools`).
+fn system_block(system: &Option<String>) -> Option<serde_json::Value> {
+    system.as_ref().map(|s| {
+        serde_json::json!([{
+            "type": "text",
+            "text": s,
+            "cache_control": { "type": "ephemeral" },
+        }])
+    })
 }
 
 /// Anthropic API error response.
@@ -220,20 +265,12 @@ impl LlmDriver for AnthropicDriver {
             .collect();
 
         // Build tools
-        let api_tools: Vec<ApiTool> = request
-            .tools
-            .iter()
-            .map(|t| ApiTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
+        let api_tools = build_api_tools(&request.tools);
 
         let api_request = ApiRequest {
             model: request.model.clone(),
             max_tokens: request.max_tokens,
-            system,
+            system: system_block(&system),
             messages: api_messages,
             tools: api_tools,
             temperature: Some(request.temperature),
@@ -327,20 +364,12 @@ impl LlmDriver for AnthropicDriver {
             .map(convert_message)
             .collect();
 
-        let api_tools: Vec<ApiTool> = request
-            .tools
-            .iter()
-            .map(|t| ApiTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
+        let api_tools = build_api_tools(&request.tools);
 
         let api_request = ApiRequest {
             model: request.model.clone(),
             max_tokens: request.max_tokens,
-            system,
+            system: system_block(&system),
             messages: api_messages,
             tools: api_tools,
             temperature: Some(request.temperature),
@@ -428,8 +457,17 @@ impl LlmDriver for AnthropicDriver {
 
                     match event_type.as_str() {
                         "message_start" => {
-                            if let Some(it) = json["message"]["usage"]["input_tokens"].as_u64() {
+                            let u = &json["message"]["usage"];
+                            if let Some(it) = u["input_tokens"].as_u64() {
                                 usage.input_tokens = it;
+                            }
+                            if let Some(cr) = u["cache_read_input_tokens"].as_u64() {
+                                usage.cache_read_tokens = cr;
+                                usage.input_tokens += cr;
+                            }
+                            if let Some(cc) = u["cache_creation_input_tokens"].as_u64() {
+                                usage.cache_creation_tokens = cc;
+                                usage.input_tokens += cc;
                             }
                         }
                         "content_block_start" => {
@@ -816,9 +854,18 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
         content,
         stop_reason,
         tool_calls,
-        usage: TokenUsage {
-            input_tokens: api.usage.input_tokens,
-            output_tokens: api.usage.output_tokens,
+        usage: {
+            // Normalize to the kernel-wide semantics: input_tokens counts
+            // every processed input token (like OpenAI's prompt_tokens);
+            // cache_* fields are reported subsets for metering discounts.
+            let cache_read = api.usage.cache_read_input_tokens.unwrap_or(0);
+            let cache_creation = api.usage.cache_creation_input_tokens.unwrap_or(0);
+            TokenUsage {
+                input_tokens: api.usage.input_tokens + cache_read + cache_creation,
+                output_tokens: api.usage.output_tokens,
+                cache_read_tokens: cache_read,
+                cache_creation_tokens: cache_creation,
+            }
         },
     }
 }
@@ -851,6 +898,8 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                            cache_read_input_tokens: None,
+                            cache_creation_input_tokens: None,
             },
         };
 
@@ -943,6 +992,8 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                            cache_read_input_tokens: None,
+                            cache_creation_input_tokens: None,
             },
         };
         let response = convert_response(api_response);
@@ -1087,6 +1138,8 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                            cache_read_input_tokens: None,
+                            cache_creation_input_tokens: None,
             },
         };
         let response = convert_response(api_response);

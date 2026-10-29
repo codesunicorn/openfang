@@ -48,6 +48,14 @@ pub struct MessageRequest {
     /// Sender display name.
     #[serde(default)]
     pub sender_name: Option<String>,
+    /// Steer a running turn instead of starting a new one.
+    ///
+    /// When `true` and the agent is mid-turn, the message is queued and the
+    /// agent loop picks it up at its next iteration boundary. When no turn is
+    /// running (or the flag is absent) the message starts a normal turn.
+    /// `"auto"` in the bridge maps to `true`.
+    #[serde(default)]
+    pub steer: Option<bool>,
 }
 
 /// Response from sending a message.

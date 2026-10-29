@@ -50,6 +50,72 @@ impl ModelCatalog {
         }
     }
 
+    /// Build a catalog from an operator-editable `models.json`.
+    ///
+    /// Falls back to the compiled-in tables when the file is missing or
+    /// malformed, so a bad edit can never brick model resolution. The file
+    /// shape is `{ "models": [...], "aliases": [[k,v],...], "providers": [...] }`
+    /// — exactly what [`builtin_catalog_json`] emits, so operators can dump,
+    /// edit (new models, price changes) and reload without a rebuild.
+    pub fn from_json_dir(path: &std::path::Path) -> Self {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(r) => r,
+            Err(_) => return Self::new(),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "models.json unreadable; using compiled-in catalog");
+                return Self::new();
+            }
+        };
+        let models: Vec<ModelCatalogEntry> =
+            match serde_json::from_value::<Vec<ModelCatalogEntry>>(parsed["models"].clone()) {
+                Ok(m) if !m.is_empty() => m,
+                _ => return Self::new(),
+            };
+        let mut aliases: HashMap<String, String> = parsed["aliases"]
+            .as_array()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|p| {
+                        Some((p.get(0)?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut providers: Vec<ProviderInfo> =
+            serde_json::from_value(parsed["providers"].clone()).unwrap_or_default();
+        if providers.is_empty() {
+            providers = builtin_providers();
+        }
+
+        for model in &models {
+            for alias in &model.aliases {
+                aliases
+                    .entry(alias.to_lowercase())
+                    .or_insert_with(|| model.id.clone());
+            }
+        }
+        for provider in &mut providers {
+            provider.model_count = models.iter().filter(|m| m.provider == provider.id).count();
+        }
+        tracing::info!(
+            models = models.len(),
+            providers = providers.len(),
+            path = %path.display(),
+            "Model catalog loaded from data file"
+        );
+
+        Self {
+            models,
+            aliases,
+            providers,
+        }
+    }
+
     /// Detect which providers have API keys configured.
     ///
     /// Checks `std::env::var()` for each provider's API key env var.
@@ -509,6 +575,23 @@ impl ModelCatalog {
             .map_err(|e| format!("Failed to write custom models file: {e}"))?;
         Ok(())
     }
+}
+
+/// Serialize the compiled-in catalog (models + aliases + providers) as JSON.
+///
+/// Used to (re)generate `models.json`, the operator-editable data file that
+/// [`ModelCatalog::from_json_dir`] prefers over the compiled-in tables.
+pub fn builtin_catalog_json() -> String {
+    let models = builtin_models();
+    let aliases: Vec<(String, String)> = builtin_aliases().into_iter().collect();
+    let providers = builtin_providers();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "version": 1,
+        "models": models,
+        "aliases": aliases,
+        "providers": providers,
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
 }
 
 impl Default for ModelCatalog {

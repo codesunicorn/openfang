@@ -39,7 +39,7 @@ api_key_env = "GROQ_API_KEY"
 max_concurrent_tools = 10
 
 [capabilities]
-tools = ["file_read", "file_write", "file_list", "shell_exec", "web_search", "web_fetch", "memory_store", "memory_recall"]
+tools = ["file_read", "file_write", "file_list", "shell_exec", "web_search", "web_fetch", "memory_store", "memory_recall", "code_execute"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]

@@ -376,6 +376,7 @@ auto_approve_shell = ["uptime", "df *", "free *"]
 | `require_approval` | list of tools, or bool | `["shell_exec"]` | Tools that always require human approval. Boolean shorthand: `false` → no tools, `true` → `["shell_exec"]`. |
 | `timeout_secs` | u64 | `60` | How long to wait for a human decision before auto-denying. Range `10..=300`. Should be ≤ the agent's tool-execution timeout, or late approvals arrive after the tool call has already timed out. |
 | `auto_approve_shell` | list of patterns | `[]` | Shell commands that skip the approval prompt — intended for read-only diagnostics (`uptime`, `df *`, `free *`, `systemctl status *`). Patterns match the literal command: `"uptime"` = exact, `"df *"` = first-word. Chained/piped/redirected commands (`;`, `&&`, `\|\|`, `\|`, `>`, `<`, `` ` ``, `$(`) **never** auto-approve and always prompt. |
+| `deny_shell` | list of patterns | `[]` | **Hard floor.** Matching commands are blocked unconditionally — before approvals, before `auto_approve_shell`, before any `exec_policy` bypass. Nothing overrides it. Same pattern forms as `auto_approve_shell`, matched against the deobfuscated command (`r\m`, `st""us` do not slip past). A chain containing a denied command is denied whole. |
 | `auto_approve` | bool | `false` | Alias: when `true`, clears `require_approval` at boot (no tools prompt). |
 | `auto_approve_autonomous` | bool | `false` | Auto-approve tool calls made during autonomous (unscheduled-by-human) agent runs. |
 
@@ -1407,6 +1408,82 @@ usage_footer = "tokens"
 | `plain_text` | No formatting markup. |
 
 ---
+
+## Code kernel (`code_execute`)
+
+Agents granted the `code_execute` tool get a **persistent Python interpreter**
+per agent. The script calls tools inline:
+
+```python
+# one turn instead of ten
+rows = []
+for path in ["a.csv", "b.csv", "c.csv"]:
+    rows.append(call_tool("file_read", path=path))
+print(sum(len(r.splitlines()) for r in rows))
+```
+
+Available inside the kernel: `file_read`, `file_write`, `file_list`,
+`memory_recall`, `memory_store`, `session_search`, `web_fetch`, `web_search`.
+`shell_exec` is deliberately excluded — arbitrary code plus shell in one step
+would bypass the approval gate.
+
+Why it matters: every classic tool iteration re-sends the whole conversation
+(30k–140k tokens on a long task). Collapsing N tool steps into one script cuts
+that to a single turn.
+
+- State (imports, variables, functions) persists between calls for the agent.
+- Exceptions return an `[error]` block and **do not** kill the interpreter.
+- Configure: `OPENFANG_PYTHON` (interpreter, default `python3`),
+  `OPENFANG_CODE_EXECUTE_TIMEOUT_SECS` (default `120`).
+- Nested calls use the same workspace sandbox, tool allowlist and `deny_shell`
+  floor as top-level calls.
+
+## Session search
+
+Schema v9 adds an FTS5 index over every stored message, so agents can answer
+"what did we decide about X?" without being told again:
+
+- Tool: `session_search(query, limit)` — bm25-ranked quotes with dates and
+  session labels.
+- API: `GET /api/sessions/search?q=tokens&limit=5`.
+
+## Mid-turn steering
+
+A message sent to an agent that is **already working** can steer it instead of
+starting a competing turn: `POST /api/agents/{id}/message` with
+`"steer": true`. The text is appended as a user turn at the agent loop's next
+iteration boundary, so "actually use the other file" takes effect mid-task.
+
+## Channel directory
+
+`channel_send` accepts a name (`#taau`) instead of an id. The directory is
+learned from traffic (every inbound message records the channel) plus optional
+operator aliases, persisted to `{data_dir}/channel_directory.json`.
+Tool: `channel_directory(channel?)`.
+
+## Build profiles (channel adapters)
+
+Only Discord, Telegram, Slack and Matrix compile by default. The other 36
+adapters are behind per-adapter Cargo features:
+
+```bash
+cargo build --release -p openfang-cli                      # core four
+cargo build --release -p openfang-cli --features full-channels   # everything
+```
+
+`openfang-api` enables `full-channels` by default, so release builds keep every
+adapter unless you opt out with `--no-default-features`.
+
+## Bundled agents
+
+`openfang` installs four agent templates by default (`assistant`, `coder`,
+`ops`, `researcher`) — every installed agent is loaded and heartbeated on boot,
+so the full 30-agent set costs scheduler and compaction churn for specialities
+most installs never use. Install everything with:
+
+```bash
+OPENFANG_INSTALL_ALL_AGENTS=1 openfang start
+```
 
 ## Environment Variables
 

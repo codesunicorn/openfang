@@ -233,6 +233,7 @@ mod tests {
             auto_approve_autonomous: false,
             auto_approve: false,
             auto_approve_shell: vec![],
+            deny_shell: vec![],
         };
         let mgr = ApprovalManager::new(policy);
         assert!(mgr.requires_approval("file_write"));
@@ -313,6 +314,7 @@ mod tests {
             auto_approve_autonomous: true,
             auto_approve: false,
             auto_approve_shell: vec![],
+            deny_shell: vec![],
         };
         mgr.update_policy(new_policy);
 

@@ -511,6 +511,26 @@ pub async fn run_agent_loop(
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
 
+        // Mid-turn steering: pick up messages the user queued while this
+        // turn was running and append them as user turns. The agent sees
+        // them on this iteration's LLM call, before choosing its next tool.
+        if iteration > 0 {
+            if let Some(kh) = kernel.as_ref() {
+                let steer = kh.take_steering(&agent_id_str);
+                for text in steer {
+                    info!(iteration, chars = text.chars().count(), "Applying queued steering message");
+                    messages.push(Message {
+                        msg_id: uuid::Uuid::new_v4().to_string(),
+                        provider_msg_id: None,
+                        role: Role::User,
+                        content: openfang_types::message::MessageContent::Text(
+                            format!("[steering from user while you were working] {text}"),
+                        ),
+                    });
+                }
+            }
+        }
+
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
             recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
@@ -782,6 +802,12 @@ pub async fn run_agent_loop(
                     agent = %manifest.name,
                     iterations = iteration + 1,
                     tokens = total_usage.total(),
+                    input_tokens = total_usage.input_tokens,
+                    output_tokens = total_usage.output_tokens,
+                    // Prompt-cache economics: hits mean the provider is
+                    // billing those input tokens at a steep discount.
+                    cache_read = total_usage.cache_read_tokens,
+                    cache_creation = total_usage.cache_creation_tokens,
                     "Agent loop completed"
                 );
 
@@ -3726,8 +3752,7 @@ mod tests {
                     }],
                     usage: TokenUsage {
                         input_tokens: 10,
-                        output_tokens: 5,
-                    },
+                        output_tokens: 5, ..Default::default() },
                 })
             } else {
                 // Second call: LLM returns EndTurn with EMPTY text (the bug)
@@ -3737,8 +3762,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 10,
-                        output_tokens: 0,
-                    },
+                        output_tokens: 0, ..Default::default() },
                 })
             }
         }
@@ -3760,8 +3784,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
-                    output_tokens: 0,
-                },
+                    output_tokens: 0, ..Default::default() },
             })
         }
     }
@@ -3784,8 +3807,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
-                    output_tokens: 8,
-                },
+                    output_tokens: 8, ..Default::default() },
             })
         }
     }
@@ -4078,8 +4100,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 10,
-                        output_tokens: 0,
-                    },
+                        output_tokens: 0, ..Default::default() },
                 })
             } else {
                 // Second call (retry): normal response
@@ -4092,8 +4113,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 15,
-                        output_tokens: 8,
-                    },
+                        output_tokens: 8, ..Default::default() },
                 })
             }
         }
@@ -4115,8 +4135,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
-                    output_tokens: 0,
-                },
+                    output_tokens: 0, ..Default::default() },
             })
         }
     }
@@ -5125,8 +5144,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 18,
-                        output_tokens: 10,
-                    },
+                        output_tokens: 10, ..Default::default() },
                 })
             } else {
                 Ok(CompletionResponse {
@@ -5138,8 +5156,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 24,
-                        output_tokens: 8,
-                    },
+                        output_tokens: 8, ..Default::default() },
                 })
             }
         }
@@ -5163,8 +5180,7 @@ mod tests {
                     tool_calls: vec![], // BUG: no tool_calls!
                     usage: TokenUsage {
                         input_tokens: 20,
-                        output_tokens: 15,
-                    },
+                        output_tokens: 15, ..Default::default() },
                 })
             } else {
                 // After tool result, return normal response
@@ -5177,8 +5193,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 30,
-                        output_tokens: 12,
-                    },
+                        output_tokens: 12, ..Default::default() },
                 })
             }
         }

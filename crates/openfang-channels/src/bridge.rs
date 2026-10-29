@@ -102,6 +102,12 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
 
+    /// Record that traffic happened in this conversation, so the agent can
+    /// address the place by name later (channel directory).
+    ///
+    /// Default: no-op. The kernel-backed handle learns name→id mappings here.
+    async fn observe_channel(&self, _message: &ChannelMessage) {}
+
     /// Opaque conversation scope for per-thread sessions (hermes/kimaki parity).
     ///
     /// Return `Some(key)` to make this conversation use its own agent session
@@ -1818,6 +1824,9 @@ async fn dispatch_message(
         text.clone()
     };
 
+    // Learn where traffic happens (channel directory) before dispatching.
+    handle.observe_channel(&message).await;
+
     // Per-thread session scope (hermes/kimaki parity) — None = legacy shared.
     let scope = handle.conversation_scope(&message).await;
 
@@ -2290,6 +2299,9 @@ async fn dispatch_with_blocks(
 
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), typing_user.clone());
+
+    // Learn where traffic happens (channel directory) before dispatching.
+    handle.observe_channel(&message).await;
 
     // Per-thread session scope (hermes/kimaki parity) — None = legacy shared.
     let scope = handle.conversation_scope(&message).await;

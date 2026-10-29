@@ -330,6 +330,42 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
 /// - `replicate` — Replicate
 /// - `chutes` — Chutes.ai (serverless open-source model inference)
 /// - Any custom provider with `base_url` set uses OpenAI-compatible format
+/// Total deadline for a single LLM HTTP request, in seconds.
+///
+/// Without a deadline, a wedged upstream (proxy hang, TLS stall, black-holed
+/// connection) pins the agent turn forever — the user sees a stuck "thinking"
+/// preview that never resolves. Env-overridable via
+/// `OPENFANG_LLM_REQUEST_TIMEOUT_SECS`; `0` disables the deadline (old behavior).
+const LLM_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// The LLM request deadline, or `None` when disabled via env.
+pub(crate) fn llm_request_timeout() -> Option<std::time::Duration> {
+    let secs = std::env::var("OPENFANG_LLM_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(LLM_REQUEST_TIMEOUT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Build the shared HTTP client with connection + idle-read deadlines.
+///
+/// `read_timeout` bounds how long a stream may sit without bytes (wedged SSE)
+/// and how long a non-streaming response may take to produce its first byte.
+pub(crate) fn build_llm_http_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(crate::USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(30));
+    if let Some(idle) = llm_request_timeout() {
+        builder = builder.read_timeout(idle);
+    }
+    builder.build().unwrap_or_default()
+}
+
+
 pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmError> {
     let provider = config.provider.as_str();
 

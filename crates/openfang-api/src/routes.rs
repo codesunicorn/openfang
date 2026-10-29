@@ -383,6 +383,22 @@ pub async fn send_message(
         None
     };
 
+    // Mid-turn steering: if the agent is already working and the caller
+    // asked to steer (or defaulted to auto), queue the message instead of
+    // starting a competing turn. The agent loop appends it to the running
+    // conversation at its next iteration boundary.
+    if req.steer.unwrap_or(false) && state.kernel.is_agent_running(agent_id) {
+        if state.kernel.queue_steering(agent_id, &req.message) {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "steered": true,
+                    "response": "Steering message queued for the running turn.",
+                })),
+            );
+        }
+    }
+
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
@@ -5833,6 +5849,30 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoRespo
     match state.kernel.memory.list_sessions() {
         Ok(sessions) => Json(serde_json::json!({"sessions": sessions})),
         Err(_) => Json(serde_json::json!({"sessions": []})),
+    }
+}
+
+/// GET /api/sessions/search?q=...&limit=5 — Full-text search across all
+/// past conversations (bm25-ranked via the schema-v9 messages_fts index).
+pub async fn search_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let query = params.get("q").cloned().unwrap_or_default();
+    if query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Missing ?q= search term"})));
+    }
+    let limit: usize = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(5)
+        .clamp(1, 20);
+    match state.kernel.memory.search_messages(&query, limit) {
+        Ok(hits) => (StatusCode::OK, Json(serde_json::json!({"query": query, "hits": hits}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 

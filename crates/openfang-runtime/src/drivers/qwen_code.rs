@@ -269,8 +269,7 @@ impl LlmDriver for QwenCodeDriver {
                 tool_calls: Vec::new(),
                 usage: TokenUsage {
                     input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
+                    output_tokens: usage.output_tokens, ..Default::default() },
             });
         }
 
@@ -284,8 +283,7 @@ impl LlmDriver for QwenCodeDriver {
             tool_calls: Vec::new(),
             usage: TokenUsage {
                 input_tokens: 0,
-                output_tokens: 0,
-            },
+                output_tokens: 0, ..Default::default() },
         })
     }
 
@@ -328,8 +326,7 @@ impl LlmDriver for QwenCodeDriver {
         let mut full_text = String::new();
         let mut final_usage = TokenUsage {
             input_tokens: 0,
-            output_tokens: 0,
-        };
+            output_tokens: 0, ..Default::default() };
 
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
@@ -362,8 +359,7 @@ impl LlmDriver for QwenCodeDriver {
                         if let Some(usage) = event.usage {
                             final_usage = TokenUsage {
                                 input_tokens: usage.input_tokens,
-                                output_tokens: usage.output_tokens,
-                            };
+                                output_tokens: usage.output_tokens, ..Default::default() };
                         }
                     }
                     _ => {

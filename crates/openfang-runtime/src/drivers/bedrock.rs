@@ -681,8 +681,7 @@ fn convert_response(resp: ConverseResponse) -> Result<CompletionResponse, LlmErr
         tool_calls,
         usage: TokenUsage {
             input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
-        },
+            output_tokens: resp.usage.output_tokens, ..Default::default() },
     })
 }
 

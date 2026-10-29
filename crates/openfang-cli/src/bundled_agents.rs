@@ -118,10 +118,28 @@ pub fn bundled_agents() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The curated agent set installed by default.
+///
+/// Every installed agent is *loaded and heartbeated* on boot, so 30 resident
+/// agents cost scheduler ticks, compaction checks and "unresponsive → crashed"
+/// churn for specialities the operator never uses. These four cover the common
+/// split (general assistant, coding, ops/monitoring, research); the rest stay
+/// available as templates via `openfang agent new --from-bundled <name>`.
+pub const CORE_AGENTS: &[&str] = &["assistant", "coder", "ops", "researcher"];
+
 /// Install bundled agent templates to `~/.openfang/agents/`.
+///
+/// Installs [`CORE_AGENTS`] by default. Set `OPENFANG_INSTALL_ALL_AGENTS=1`
+/// to install the full bundled set (the pre-0.7 behaviour).
 /// Skips any template that already exists on disk (user customization preserved).
 pub fn install_bundled_agents(agents_dir: &std::path::Path) {
+    let install_all = std::env::var("OPENFANG_INSTALL_ALL_AGENTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     for (name, content) in bundled_agents() {
+        if !install_all && !CORE_AGENTS.contains(&name) {
+            continue;
+        }
         let dest_dir = agents_dir.join(name);
         let dest_file = dest_dir.join("agent.toml");
         if dest_file.exists() {

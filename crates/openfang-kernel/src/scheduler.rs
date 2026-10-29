@@ -174,8 +174,7 @@ mod tests {
             id,
             &TokenUsage {
                 input_tokens: 100,
-                output_tokens: 50,
-            },
+                output_tokens: 50, ..Default::default() },
         );
         let (tokens, _) = scheduler.get_usage(id).unwrap();
         assert_eq!(tokens, 150);
@@ -194,8 +193,7 @@ mod tests {
             id,
             &TokenUsage {
                 input_tokens: 60,
-                output_tokens: 50,
-            },
+                output_tokens: 50, ..Default::default() },
         );
         assert!(scheduler.check_quota(id).is_err());
     }
@@ -216,8 +214,7 @@ mod tests {
             id,
             &TokenUsage {
                 input_tokens: 60,
-                output_tokens: 50,
-            },
+                output_tokens: 50, ..Default::default() },
         );
         assert!(scheduler.check_quota(id).is_err()); // 110 / 100
 

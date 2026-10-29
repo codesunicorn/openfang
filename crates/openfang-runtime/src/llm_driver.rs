@@ -284,8 +284,7 @@ mod tests {
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage {
                     input_tokens: 10,
-                    output_tokens: 5,
-                },
+                    output_tokens: 5, ..Default::default() },
             },
         ];
         assert_eq!(events.len(), 5);
@@ -312,8 +311,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage {
                         input_tokens: 5,
-                        output_tokens: 3,
-                    },
+                        output_tokens: 3, ..Default::default() },
                 })
             }
         }

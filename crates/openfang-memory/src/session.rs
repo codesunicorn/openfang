@@ -30,6 +30,24 @@ pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
 }
 
+
+/// A full-text search hit over historical messages (see [`SessionStore::search_messages`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MessageSearchHit {
+    /// Session the message belongs to.
+    pub session_id: String,
+    /// Agent that owned the session.
+    pub agent_id: String,
+    /// `user` / `assistant` / `system`.
+    pub role: String,
+    /// Message text.
+    pub content: String,
+    /// When the session was last saved.
+    pub created_at: String,
+    /// Human-readable session label, when set.
+    pub session_label: Option<String>,
+}
+
 impl SessionStore {
     /// Create a new session store wrapping the given connection.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
@@ -97,6 +115,34 @@ impl SessionStore {
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        // Keep the searchable message mirror in sync (schema v9): replace
+        // the session's rows wholesale. Sessions are small (tens-hundreds of
+        // messages) and this makes compaction/deletion naturally consistent.
+        // The messages_fts triggers keep the FTS index in sync with `messages`.
+        {
+            let sid = session.id.0.to_string();
+            let aid = session.agent_id.0.to_string();
+            conn.execute("DELETE FROM messages WHERE session_id = ?1", [&sid])
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let role_str = |r: &openfang_types::message::Role| match r {
+                openfang_types::message::Role::System => "system",
+                openfang_types::message::Role::User => "user",
+                openfang_types::message::Role::Assistant => "assistant",
+            };
+            for (seq, msg) in session.messages.iter().enumerate() {
+                let text = msg.content.text_content();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                conn.execute(
+                    "INSERT INTO messages (session_id, agent_id, seq, role, content, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![sid, aid, seq as i64, role_str(&msg.role), text, now],
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            }
+        }
         Ok(())
     }
 
@@ -111,7 +157,81 @@ impl SessionStore {
             rusqlite::params![session_id.0.to_string()],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        // Cascade to the searchable mirror (schema v9). FTS rows are
+        // removed by the messages_fts_del trigger.
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            rusqlite::params![session_id.0.to_string()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    /// Full-text search across every session's messages (schema v9 FTS5).
+    ///
+    /// Returns bm25-ranked hits with session/agent attribution and, when the
+    /// session has a label, the human-readable conversation label. `limit`
+    /// caps result count (callers should keep it small, e.g. 5-10).
+    pub fn search_messages(&self, query: &str, limit: usize) -> OpenFangResult<Vec<MessageSearchHit>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        // Two-step search: FTS5 aux functions (bm25) only resolve against a
+        // direct FTS cursor, so rank first, then hydrate hit rows. Rank order
+        // is preserved by walking the ids in sequence.
+        let ranked_ids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid FROM messages_fts
+                     WHERE messages_fts MATCH ?1
+                     ORDER BY bm25(messages_fts)
+                     LIMIT ?2",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![query.trim(), limit as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let mut ids = Vec::new();
+            for id in rows {
+                ids.push(id.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+            }
+            ids
+        };
+        if ranked_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut hits = Vec::with_capacity(ranked_ids.len());
+        for id in ranked_ids {
+            let hit = conn
+                .query_row(
+                    "SELECT m.session_id, m.agent_id, m.role, m.content, m.created_at, s.label
+                     FROM messages m
+                     LEFT JOIN sessions s ON s.id = m.session_id
+                     WHERE m.id = ?1",
+                    rusqlite::params![id],
+                    |row| {
+                        Ok(MessageSearchHit {
+                            session_id: row.get(0)?,
+                            agent_id: row.get(1)?,
+                            role: row.get(2)?,
+                            content: row.get(3)?,
+                            created_at: row.get(4)?,
+                            session_label: row.get(5)?,
+                        })
+                    },
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            hits.push(hit);
+        }
+        Ok(hits)
     }
 
     /// Delete all sessions belonging to an agent.
@@ -122,6 +242,11 @@ impl SessionStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         conn.execute(
             "DELETE FROM sessions WHERE agent_id = ?1",
+            rusqlite::params![agent_id.0.to_string()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM messages WHERE agent_id = ?1",
             rusqlite::params![agent_id.0.to_string()],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -681,6 +806,58 @@ mod tests {
         let store = setup();
         let result = store.get_session(SessionId::new()).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_search_messages_fts() {
+        let store = setup();
+        let agent = AgentId::new();
+        let session = store.create_session(agent).unwrap();
+        let mut s = store.get_session(session.id).unwrap().unwrap();
+        s.messages.push(openfang_types::message::Message {
+            msg_id: "m1".into(),
+            provider_msg_id: None,
+            role: openfang_types::message::Role::User,
+            content: openfang_types::message::MessageContent::Text(
+                "we decided the salon funnel runs weekly on Sundays".into(),
+            ),
+        });
+        s.messages.push(openfang_types::message::Message {
+            msg_id: "m2".into(),
+            provider_msg_id: None,
+            role: openfang_types::message::Role::Assistant,
+            content: openfang_types::message::MessageContent::Text(
+                "noted, I will track the salon funnel budget too".into(),
+            ),
+        });
+        store.save_session(&s).unwrap();
+
+        // Ranked hit on both messages containing the phrase.
+        let hits = store.search_messages("salon funnel", 5).unwrap();
+        assert!(!hits.is_empty(), "expected FTS hits for 'salon funnel'");
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].session_id == session.id.0.to_string());
+        assert!(hits.iter().any(|h| h.content.contains("Sundays")));
+
+        // No match for unrelated terms.
+        assert!(store.search_messages("docker kubernetes", 5).unwrap().is_empty());
+
+        // Re-save with fewer messages (compaction) then search again: stale
+        // rows must not survive the wholesale sync.
+        let mut trimmed = s.clone();
+        trimmed.messages.truncate(1);
+        store.save_session(&trimmed).unwrap();
+        let hits = store.search_messages("budget", 5).unwrap();
+        assert!(hits.is_empty(), "compacted message must not be searchable");
+        assert_eq!(store.search_messages("Sundays", 5).unwrap().len(), 1);
+
+        // Porter stemming: "running" should match "runs".
+        let hits = store.search_messages("running", 5).unwrap();
+        assert_eq!(hits.len(), 1, "stemmer should match running<->runs");
+
+        // Delete session -> mirror + FTS rows go too.
+        store.delete_session(session.id).unwrap();
+        assert!(store.search_messages("salon", 5).unwrap().is_empty());
     }
 
     #[test]

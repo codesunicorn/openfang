@@ -197,6 +197,16 @@ impl MemorySubstrate {
         self.sessions.save_session(session)
     }
 
+    /// Full-text search across every session's messages (schema v9 FTS5).
+    /// Returns bm25-ranked hits with session/agent attribution.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> OpenFangResult<Vec<crate::session::MessageSearchHit>> {
+        self.sessions.search_messages(query, limit)
+    }
+
     /// Save a session asynchronously — runs the SQLite write in a blocking
     /// thread so the tokio runtime stays responsive.
     pub async fn save_session_async(&self, session: &Session) -> OpenFangResult<()> {

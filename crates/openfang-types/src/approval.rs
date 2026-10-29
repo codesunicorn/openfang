@@ -194,6 +194,17 @@ pub struct ApprovalPolicy {
     /// commands fall through to the normal approval prompt, and the shell
     /// guard rejects chains anyway.
     pub auto_approve_shell: Vec<String>,
+    /// Hard-deny floor for shell commands. Default: empty.
+    ///
+    /// A match BLOCKS execution unconditionally — before approvals, before
+    /// `auto_approve_shell`, before `exec_policy` bypass, before everything
+    /// else the operator configured later. This is the one list that cannot
+    /// be talked around by yolo-mode or exemption drift.
+    ///
+    /// Same pattern forms as `auto_approve_shell`. Both are matched against
+    /// the DEOBFUSCATED command (see [`normalize_shell_command`]) — quoting
+    /// tricks like `r\\m` or `st""us` do not bypass the floor.
+    pub deny_shell: Vec<String>,
 }
 
 impl Default for ApprovalPolicy {
@@ -204,6 +215,7 @@ impl Default for ApprovalPolicy {
             auto_approve_autonomous: false,
             auto_approve: false,
             auto_approve_shell: Vec::new(),
+            deny_shell: Vec::new(),
         }
     }
 }
@@ -212,34 +224,168 @@ impl ApprovalPolicy {
     /// True when `command` matches a configured `auto_approve_shell` pattern.
     ///
     /// See [`ApprovalPolicy::auto_approve_shell`] for pattern semantics and
-    /// the metacharacter safety rule.
+    /// the metacharacter safety rule. Matching runs on the deobfuscated
+    /// command (see [`normalize_shell_command`]).
     pub fn shell_auto_approved(&self, command: &str) -> bool {
         if self.auto_approve_shell.is_empty() {
             return false;
         }
-        let trimmed = command.trim();
-        if trimmed.is_empty() {
+        let normalized = normalize_shell_command(command);
+        if normalized.is_empty() {
             return false;
         }
         // Never auto-approve anything with chaining/piping/redirection or
         // command substitution — only a single plain command qualifies.
-        if trimmed.chars().any(|c| matches!(c, ';' | '&' | '|' | '>' | '<' | '`'))
-            || trimmed.contains("$(")
-        {
+        if command_has_chain_metachar(&normalized) {
             return false;
         }
-        let first_word = trimmed.split_whitespace().next().unwrap_or("");
-        self.auto_approve_shell.iter().any(|pattern| {
-            let pattern = pattern.trim();
-            if let Some(prefix) = pattern.strip_suffix(" *") {
-                !prefix.is_empty() && first_word == prefix
-            } else if pattern == "*" {
-                false // "everything" is too broad to auto-approve silently
-            } else {
-                trimmed == pattern
-            }
-        })
+        shell_pattern_matches(&self.auto_approve_shell, &normalized)
     }
+
+    /// True when `command` matches the hard-deny floor (`deny_shell`).
+    ///
+    /// Floors fire before approvals, auto-approve exemptions and exec-policy
+    /// bypasses. Matching runs on the deobfuscated command, and a chain that
+    /// contains a denied command anywhere is denied as a whole.
+    pub fn shell_denied(&self, command: &str) -> bool {
+        if self.deny_shell.is_empty() {
+            return false;
+        }
+        let normalized = normalize_shell_command(command);
+        if normalized.is_empty() {
+            return false;
+        }
+        if !command_has_chain_metachar(&normalized) {
+            return shell_pattern_matches(&self.deny_shell, &normalized);
+        }
+        // Chain: deny if any segment matches a deny pattern. Conservative by
+        // design — the guard already rejects chains, this is defense in depth.
+        let segments: Vec<&str> = normalized
+            .split(|c| matches!(c, ';' | '&' | '|' | '>' | '<'))
+            .flat_map(|seg| seg.split('`'))
+            .map(|seg| seg.trim())
+            .filter(|seg| !seg.is_empty())
+            .collect();
+        segments.iter().any(|seg| shell_pattern_matches(&self.deny_shell, seg))
+    }
+}
+
+/// True when the (normalized) command contains chaining/piping/redirection or
+/// command substitution — i.e. it is not a single plain command.
+fn command_has_chain_metachar(normalized: &str) -> bool {
+    normalized
+        .chars()
+        .any(|c| matches!(c, ';' | '&' | '|' | '>' | '<' | '`'))
+        || normalized.contains("$(")
+}
+
+/// Match a pattern list against a normalized command.
+///
+/// Pattern forms:
+/// - no `*` — exact match of the whole command (`"uptime"`)
+/// - `"df *"` — glob: `df` followed by anything (`df -h`, `df /`, bare `df`)
+/// - `"dd if=*"` — glob anywhere the `*` appears (`dd if=/dev/zero ...`)
+/// - `"*"` alone is never matched — "allow everything" is not an exemption
+fn shell_pattern_matches(patterns: &[String], normalized: &str) -> bool {
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || pattern == "*" {
+            return false;
+        }
+        if pattern.contains('*') {
+            glob_match(pattern, normalized)
+                // "df *" must also match the bare command "df"
+                || pattern
+                    .split('*')
+                    .next()
+                    .map(|prefix| {
+                        let bare = prefix.trim_end();
+                        !bare.is_empty() && normalized == bare
+                    })
+                    .unwrap_or(false)
+        } else {
+            normalized == pattern
+        }
+    })
+}
+
+/// Minimal shell-style glob: `*` matches any run of characters (including
+/// none), everything else is literal. Anchored at both ends.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let first = parts[0];
+    let last = parts[parts.len() - 1];
+    if !text.starts_with(first) {
+        return false;
+    }
+    let mut pos = first.len();
+    let stop = text.len().saturating_sub(last.len());
+    if pos > stop {
+        return false;
+    }
+    for mid in &parts[1..parts.len() - 1] {
+        match text[pos..stop].find(mid) {
+            Some(idx) => pos += idx + mid.len(),
+            None => return false,
+        }
+    }
+    text.ends_with(last)
+}
+
+/// Deobfuscate a shell command for SECURITY MATCHING (never for execution).
+///
+/// Removes the quoting/escaping tricks that slip a command name past naive
+/// string matching, approximating what a POSIX shell lexer turns into argv:
+/// - `r\\m` (backslash inside a word) → `rm`
+/// - `st""us` / `st''us` (empty-quote concatenation) → `stus`
+/// - `'doc'ker ps` → `docker ps` (quotes dropped, word boundaries kept)
+/// - whitespace collapsed to single spaces
+///
+/// Metacharacters the guard blocks (`;`, `|`, `>`, `<`, backticks, `$(`)
+/// survive normalization on purpose — the guard must still see them.
+pub fn normalize_shell_command(command: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut chars = command.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                // POSIX backslash escape inside a word: the next char joins
+                // the word literally.
+                if let Some(&next) = chars.peek() {
+                    if !matches!(next, ' ' | '\t' | '\n' | '\r') || !word.is_empty() {
+                        word.push(next);
+                    }
+                    chars.next();
+                }
+            }
+            '\'' | '"' => {
+                // Quoted region: contents join the word literally, the quote
+                // marks themselves vanish. `st""us` therefore becomes `stus`.
+                let quote = c;
+                for next in chars.by_ref() {
+                    if next == quote {
+                        break;
+                    }
+                    word.push(next);
+                }
+            }
+            c if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words.join(" ")
 }
 
 /// Custom deserializer that accepts:
@@ -738,6 +884,7 @@ mod tests {
             auto_approve_autonomous: true,
             auto_approve: false,
             auto_approve_shell: vec![],
+            deny_shell: vec![],
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
@@ -758,6 +905,95 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    fn deny_policy() -> ApprovalPolicy {
+        ApprovalPolicy {
+            deny_shell: vec!["rm *".into(), "shutdown *".into(), "dd *".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_deny_floor_blocks_deobfuscated_commands() {
+        let p = deny_policy();
+        assert!(p.shell_denied("rm -rf /"));
+        // Quoting tricks must not bypass the floor.
+        assert!(p.shell_denied("r\\m -rf /"));
+        assert!(p.shell_denied("r''m -rf /"));
+        assert!(p.shell_denied("rm -rf /tmp/x"));
+        assert!(p.shell_denied("sh''utdown now"));
+        // Chains containing a denied command anywhere are denied.
+        assert!(p.shell_denied("uptime && rm -rf /"));
+        // Benign commands are not denied.
+        assert!(!p.shell_denied("uptime"));
+        assert!(!p.shell_denied("free -m"));
+        // Empty floor denies nothing.
+        assert!(!ApprovalPolicy::default().shell_denied("rm -rf /"));
+    }
+
+    #[test]
+    fn test_deny_glob_forms() {
+        let p = ApprovalPolicy {
+            deny_shell: vec![
+                "dd if=*".into(),
+                "mkfs *".into(),
+                "mkfs.*".into(),
+                "rm -rf /".into(),
+                "shutdown *".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(p.shell_denied("dd if=/dev/zero of=/tmp/x count=1"));
+        assert!(p.shell_denied("dd if=/dev/urandom of=/dev/sda"));
+        // `mkfs *` = first word exactly "mkfs"; `mkfs.*` catches variants.
+        assert!(p.shell_denied("mkfs /dev/sdb1"));
+        assert!(p.shell_denied("mkfs.ext4 /dev/sdb1"));
+        assert!(p.shell_denied("mkfs /dev/sdb1"));
+        assert!(p.shell_denied("shutdown -h now"));
+        assert!(p.shell_denied("rm -rf /"));
+        // Deobfuscation still applies.
+        assert!(p.shell_denied(r"d\d if=/dev/zero of=/dev/sda"));
+        // Benign neighbours are untouched.
+        assert!(!p.shell_denied("df -h"));
+        assert!(!p.shell_denied("dd --help"));
+    }
+
+    #[test]
+    fn test_auto_approve_glob_forms() {
+        let p = ApprovalPolicy {
+            auto_approve_shell: vec!["uptime".into(), "df *".into(), "systemctl status *".into()],
+            ..Default::default()
+        };
+        assert!(p.shell_auto_approved("df"));
+        assert!(p.shell_auto_approved("df -h"));
+        assert!(p.shell_auto_approved("systemctl status nginx"));
+        assert!(!p.shell_auto_approved("systemctl restart nginx"));
+        assert!(!p.shell_auto_approved("df -h; rm -rf /"));
+    }
+
+    #[test]
+    fn test_normalize_shell_command() {
+        use normalize_shell_command as norm;
+        assert_eq!(norm("uptime"), "uptime");
+        assert_eq!(norm("r\\m -rf /"), "rm -rf /");
+        assert_eq!(norm("st\"\"us"), "stus");
+        assert_eq!(norm("st''us"), "stus");
+        assert_eq!(norm("'doc'ker ps"), "docker ps");
+        assert_eq!(norm("docker  ps"), "docker ps");
+        assert_eq!(norm("docker ps 'a b'"), "docker ps a b");
+        // Guard-relevant metachars survive.
+        assert!(norm("a && b").contains('&'));
+        assert!(norm("a `b`").contains('`'));
+    }
+
+    #[test]
+    fn test_auto_approve_matches_deobfuscated() {
+        let p = readonly_policy();
+        // The executed command IS uptime (shlex collapses the quotes) — so
+        // the exemption list must recognize it too.
+        assert!(p.shell_auto_approved("up\"\"time"));
+        assert!(p.shell_auto_approved("'df' -h"));
     }
 
     #[test]

@@ -69,7 +69,7 @@ api_key_env = "GEMINI_API_KEY"
 max_concurrent_tools = 10
 
 [capabilities]
-tools = ["file_read", "file_write", "file_list", "memory_store", "memory_recall", "web_fetch", "shell_exec", "agent_send", "agent_list"]
+tools = ["file_read", "file_write", "file_list", "memory_store", "memory_recall", "web_fetch", "shell_exec", "agent_send", "agent_list", "code_execute"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*", "shared.*"]

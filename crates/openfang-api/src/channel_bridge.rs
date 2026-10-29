@@ -5,54 +5,93 @@
 
 use openfang_channels::bridge::{BridgeManager, ChannelBridgeHandle};
 use openfang_channels::discord::DiscordAdapter;
+#[cfg(feature = "email")]
 use openfang_channels::email::EmailAdapter;
+#[cfg(feature = "google_chat")]
 use openfang_channels::google_chat::GoogleChatAdapter;
+#[cfg(feature = "irc")]
 use openfang_channels::irc::IrcAdapter;
 use openfang_channels::matrix::MatrixAdapter;
+#[cfg(feature = "mattermost")]
 use openfang_channels::mattermost::MattermostAdapter;
+#[cfg(feature = "rocketchat")]
 use openfang_channels::rocketchat::RocketChatAdapter;
 use openfang_channels::router::AgentRouter;
+#[cfg(feature = "signal")]
 use openfang_channels::signal::SignalAdapter;
 use openfang_channels::slack::SlackAdapter;
+#[cfg(feature = "teams")]
 use openfang_channels::teams::TeamsAdapter;
 use openfang_channels::telegram::TelegramAdapter;
+#[cfg(feature = "twitch")]
 use openfang_channels::twitch::TwitchAdapter;
 use openfang_channels::types::ChannelAdapter;
+#[cfg(feature = "whatsapp")]
 use openfang_channels::whatsapp::WhatsAppAdapter;
+#[cfg(feature = "xmpp")]
 use openfang_channels::xmpp::XmppAdapter;
+#[cfg(feature = "zulip")]
 use openfang_channels::zulip::ZulipAdapter;
 // Wave 3
+#[cfg(feature = "bluesky")]
 use openfang_channels::bluesky::BlueskyAdapter;
+#[cfg(feature = "feishu")]
 use openfang_channels::feishu::FeishuAdapter;
+#[cfg(feature = "line")]
 use openfang_channels::line::LineAdapter;
+#[cfg(feature = "mastodon")]
 use openfang_channels::mastodon::MastodonAdapter;
+#[cfg(feature = "messenger")]
 use openfang_channels::messenger::MessengerAdapter;
+#[cfg(feature = "reddit")]
 use openfang_channels::reddit::RedditAdapter;
+#[cfg(feature = "revolt")]
 use openfang_channels::revolt::RevoltAdapter;
+#[cfg(feature = "viber")]
 use openfang_channels::viber::ViberAdapter;
 use openfang_types::config::FeishuMode;
 // Wave 4
+#[cfg(feature = "flock")]
 use openfang_channels::flock::FlockAdapter;
+#[cfg(feature = "guilded")]
 use openfang_channels::guilded::GuildedAdapter;
+#[cfg(feature = "keybase")]
 use openfang_channels::keybase::KeybaseAdapter;
+#[cfg(feature = "nextcloud")]
 use openfang_channels::nextcloud::NextcloudAdapter;
+#[cfg(feature = "nostr")]
 use openfang_channels::nostr::NostrAdapter;
+#[cfg(feature = "pumble")]
 use openfang_channels::pumble::PumbleAdapter;
+#[cfg(feature = "threema")]
 use openfang_channels::threema::ThreemaAdapter;
+#[cfg(feature = "twist")]
 use openfang_channels::twist::TwistAdapter;
+#[cfg(feature = "webex")]
 use openfang_channels::webex::WebexAdapter;
 // Wave 5
 use async_trait::async_trait;
+#[cfg(feature = "dingtalk")]
 use openfang_channels::dingtalk::DingTalkAdapter;
+#[cfg(feature = "dingtalk_stream")]
 use openfang_channels::dingtalk_stream::DingTalkStreamAdapter;
+#[cfg(feature = "discourse")]
 use openfang_channels::discourse::DiscourseAdapter;
+#[cfg(feature = "gitter")]
 use openfang_channels::gitter::GitterAdapter;
+#[cfg(feature = "gotify")]
 use openfang_channels::gotify::GotifyAdapter;
+#[cfg(feature = "linkedin")]
 use openfang_channels::linkedin::LinkedInAdapter;
+#[cfg(feature = "mqtt")]
 use openfang_channels::mqtt::MqttAdapter;
+#[cfg(feature = "mumble")]
 use openfang_channels::mumble::MumbleAdapter;
+#[cfg(feature = "ntfy")]
 use openfang_channels::ntfy::NtfyAdapter;
+#[cfg(feature = "webhook")]
 use openfang_channels::webhook::WebhookAdapter;
+#[cfg(feature = "wecom")]
 use openfang_channels::wecom::WeComAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
@@ -141,6 +180,24 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     /// Also includes a per-agent epoch that the `/reset` (session reset)
     /// command bumps — no extra plumbing needed, because resetting rotates
     /// `entry.session_id`, which the scope string embeds.
+    async fn observe_channel(&self, message: &openfang_channels::types::ChannelMessage) {
+        // Discord/Slack/Telegram give us a channel name in metadata when the
+        // adapter can see it; otherwise fall back to the conversation id so
+        // the entry is still addressable by id.
+        let channel_type = format!("{:?}", message.channel).to_lowercase();
+        let id = message
+            .metadata
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&message.sender.platform_id);
+        let name = message
+            .metadata
+            .get("channel_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| message.metadata.get("guild_name").and_then(|v| v.as_str()));
+        self.kernel.channel_directory.observe(&channel_type, id, name);
+    }
+
     async fn conversation_scope(
         &self,
         message: &openfang_channels::types::ChannelMessage,
@@ -1406,6 +1463,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // WhatsApp — supports Cloud API mode (access token) or Web/QR mode (gateway URL)
+    #[cfg(feature = "whatsapp")]
     if let Some(ref wa_config) = config.whatsapp {
         let cloud_token = read_token(&wa_config.access_token_env, "WhatsApp");
         let gateway_url = std::env::var(&wa_config.gateway_url_env)
@@ -1431,6 +1489,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Signal
+    #[cfg(feature = "signal")]
     if let Some(ref sig_config) = config.signal {
         if !sig_config.phone_number.is_empty() {
             let adapter = Arc::new(SignalAdapter::new(
@@ -1466,6 +1525,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Email
+    #[cfg(feature = "email")]
     if let Some(ref em_config) = config.email {
         if let Some(password) = read_token(&em_config.password_env, "Email") {
             let adapter = Arc::new(EmailAdapter::new(
@@ -1484,6 +1544,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Teams
+    #[cfg(feature = "teams")]
     if let Some(ref tm_config) = config.teams {
         if let Some(password) = read_token(&tm_config.app_password_env, "Teams") {
             let adapter = Arc::new(TeamsAdapter::new(
@@ -1497,6 +1558,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Mattermost
+    #[cfg(feature = "mattermost")]
     if let Some(ref mm_config) = config.mattermost {
         if let Some(token) = read_token(&mm_config.token_env, "Mattermost") {
             let adapter = Arc::new(MattermostAdapter::new(
@@ -1509,6 +1571,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // IRC
+    #[cfg(feature = "irc")]
     if let Some(ref irc_config) = config.irc {
         if !irc_config.server.is_empty() {
             let password = irc_config
@@ -1530,6 +1593,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Google Chat
+    #[cfg(feature = "google_chat")]
     if let Some(ref gc_config) = config.google_chat {
         if let Some(key) = read_token(&gc_config.service_account_env, "Google Chat") {
             let adapter = Arc::new(GoogleChatAdapter::new(
@@ -1542,6 +1606,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Twitch
+    #[cfg(feature = "twitch")]
     if let Some(ref tw_config) = config.twitch {
         if let Some(token) = read_token(&tw_config.oauth_token_env, "Twitch") {
             let adapter = Arc::new(TwitchAdapter::new(
@@ -1554,6 +1619,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Rocket.Chat
+    #[cfg(feature = "rocketchat")]
     if let Some(ref rc_config) = config.rocketchat {
         if let Some(token) = read_token(&rc_config.token_env, "Rocket.Chat") {
             let adapter = Arc::new(RocketChatAdapter::new(
@@ -1567,6 +1633,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Zulip
+    #[cfg(feature = "zulip")]
     if let Some(ref z_config) = config.zulip {
         if let Some(api_key) = read_token(&z_config.api_key_env, "Zulip") {
             let adapter = Arc::new(ZulipAdapter::new(
@@ -1580,6 +1647,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // XMPP
+    #[cfg(feature = "xmpp")]
     if let Some(ref x_config) = config.xmpp {
         if let Some(password) = read_token(&x_config.password_env, "XMPP") {
             let adapter = Arc::new(XmppAdapter::new(
@@ -1596,6 +1664,7 @@ pub async fn start_channel_bridge_with_config(
     // ── Wave 3 ──────────────────────────────────────────────────
 
     // LINE
+    #[cfg(feature = "line")]
     if let Some(ref ln_config) = config.line {
         if let Some(secret) = read_token(&ln_config.channel_secret_env, "LINE (secret)") {
             if let Some(token) = read_token(&ln_config.access_token_env, "LINE (token)") {
@@ -1606,6 +1675,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Viber
+    #[cfg(feature = "viber")]
     if let Some(ref vb_config) = config.viber {
         if let Some(token) = read_token(&vb_config.auth_token_env, "Viber") {
             let adapter = Arc::new(ViberAdapter::new(
@@ -1618,6 +1688,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Facebook Messenger
+    #[cfg(feature = "messenger")]
     if let Some(ref ms_config) = config.messenger {
         if let Some(page_token) = read_token(&ms_config.page_token_env, "Messenger (page)") {
             let verify_token =
@@ -1632,6 +1703,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Reddit
+    #[cfg(feature = "reddit")]
     if let Some(ref rd_config) = config.reddit {
         if let Some(secret) = read_token(&rd_config.client_secret_env, "Reddit (secret)") {
             if let Some(password) = read_token(&rd_config.password_env, "Reddit (password)") {
@@ -1648,6 +1720,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Mastodon
+    #[cfg(feature = "mastodon")]
     if let Some(ref md_config) = config.mastodon {
         if let Some(token) = read_token(&md_config.access_token_env, "Mastodon") {
             let adapter = Arc::new(MastodonAdapter::new(md_config.instance_url.clone(), token));
@@ -1656,6 +1729,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Bluesky
+    #[cfg(feature = "bluesky")]
     if let Some(ref bs_config) = config.bluesky {
         if let Some(password) = read_token(&bs_config.app_password_env, "Bluesky") {
             let adapter = Arc::new(BlueskyAdapter::new(bs_config.identifier.clone(), password));
@@ -1664,6 +1738,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Feishu/Lark
+    #[cfg(feature = "feishu")]
     if let Some(ref fs_config) = config.feishu {
         if let Some(secret) = read_token(&fs_config.app_secret_env, "Feishu") {
             let region = openfang_channels::feishu::FeishuRegion::parse_region(&fs_config.region);
@@ -1693,6 +1768,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Revolt
+    #[cfg(feature = "revolt")]
     if let Some(ref rv_config) = config.revolt {
         if let Some(token) = read_token(&rv_config.bot_token_env, "Revolt") {
             let mut adapter = RevoltAdapter::with_urls(
@@ -1708,6 +1784,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // WeCom/WeChat Work
+    #[cfg(feature = "wecom")]
     if let Some(ref wc_config) = config.wecom {
         if let Some(secret) = read_token(&wc_config.secret_env, "WeCom") {
             let adapter = Arc::new(WeComAdapter::with_verification(
@@ -1725,6 +1802,7 @@ pub async fn start_channel_bridge_with_config(
     // ── Wave 4 ──────────────────────────────────────────────────
 
     // Nextcloud Talk
+    #[cfg(feature = "nextcloud")]
     if let Some(ref nc_config) = config.nextcloud {
         if let Some(token) = read_token(&nc_config.token_env, "Nextcloud") {
             let adapter = Arc::new(NextcloudAdapter::new(
@@ -1737,6 +1815,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Guilded
+    #[cfg(feature = "guilded")]
     if let Some(ref gd_config) = config.guilded {
         if let Some(token) = read_token(&gd_config.bot_token_env, "Guilded") {
             let adapter = Arc::new(GuildedAdapter::new(token, gd_config.server_ids.clone()));
@@ -1745,6 +1824,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Keybase
+    #[cfg(feature = "keybase")]
     if let Some(ref kb_config) = config.keybase {
         if let Some(paperkey) = read_token(&kb_config.paperkey_env, "Keybase") {
             let adapter = Arc::new(KeybaseAdapter::new(
@@ -1757,6 +1837,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Threema
+    #[cfg(feature = "threema")]
     if let Some(ref tm_config) = config.threema {
         if let Some(secret) = read_token(&tm_config.secret_env, "Threema") {
             let adapter = Arc::new(ThreemaAdapter::new(
@@ -1769,6 +1850,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Nostr
+    #[cfg(feature = "nostr")]
     if let Some(ref ns_config) = config.nostr {
         if let Some(key) = read_token(&ns_config.private_key_env, "Nostr") {
             let adapter = Arc::new(NostrAdapter::new(key, ns_config.relays.clone()));
@@ -1777,6 +1859,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Webex
+    #[cfg(feature = "webex")]
     if let Some(ref wx_config) = config.webex {
         if let Some(token) = read_token(&wx_config.bot_token_env, "Webex") {
             let adapter = Arc::new(WebexAdapter::new(token, wx_config.allowed_rooms.clone()));
@@ -1785,6 +1868,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Pumble
+    #[cfg(feature = "pumble")]
     if let Some(ref pb_config) = config.pumble {
         if let Some(token) = read_token(&pb_config.bot_token_env, "Pumble") {
             let adapter = Arc::new(PumbleAdapter::new(token, pb_config.webhook_port));
@@ -1793,6 +1877,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Flock
+    #[cfg(feature = "flock")]
     if let Some(ref fl_config) = config.flock {
         if let Some(token) = read_token(&fl_config.bot_token_env, "Flock") {
             let adapter = Arc::new(FlockAdapter::new(token, fl_config.webhook_port));
@@ -1801,6 +1886,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Twist
+    #[cfg(feature = "twist")]
     if let Some(ref tw_config) = config.twist {
         if let Some(token) = read_token(&tw_config.token_env, "Twist") {
             let adapter = Arc::new(TwistAdapter::new(
@@ -1815,6 +1901,7 @@ pub async fn start_channel_bridge_with_config(
     // ── Wave 5 ──────────────────────────────────────────────────
 
     // Mumble
+    #[cfg(feature = "mumble")]
     if let Some(ref mb_config) = config.mumble {
         if let Some(password) = read_token(&mb_config.password_env, "Mumble") {
             let adapter = Arc::new(MumbleAdapter::new(
@@ -1829,6 +1916,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // DingTalk (webhook mode)
+    #[cfg(feature = "dingtalk")]
     if let Some(ref dt_config) = config.dingtalk {
         if let Some(token) = read_token(&dt_config.access_token_env, "DingTalk") {
             let secret = read_token(&dt_config.secret_env, "DingTalk (secret)").unwrap_or_default();
@@ -1838,6 +1926,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // DingTalk (stream mode)
+    #[cfg(feature = "dingtalk_stream")]
     if let Some(ref ds_config) = config.dingtalk_stream {
         if let Some(app_key) = read_token(&ds_config.app_key_env, "DingTalk Stream (app_key)") {
             if let Some(app_secret) =
@@ -1853,6 +1942,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Discourse
+    #[cfg(feature = "discourse")]
     if let Some(ref dc_config) = config.discourse {
         if let Some(api_key) = read_token(&dc_config.api_key_env, "Discourse") {
             let adapter = Arc::new(DiscourseAdapter::new(
@@ -1866,6 +1956,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Gitter
+    #[cfg(feature = "gitter")]
     if let Some(ref gt_config) = config.gitter {
         if let Some(token) = read_token(&gt_config.token_env, "Gitter") {
             let adapter = Arc::new(GitterAdapter::new(token, gt_config.room_id.clone()));
@@ -1874,6 +1965,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // ntfy
+    #[cfg(feature = "ntfy")]
     if let Some(ref nf_config) = config.ntfy {
         let token = if nf_config.token_env.is_empty() {
             String::new()
@@ -1889,6 +1981,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Gotify
+    #[cfg(feature = "gotify")]
     if let Some(ref gf_config) = config.gotify {
         if let Some(app_token) = read_token(&gf_config.app_token_env, "Gotify (app)") {
             let client_token =
@@ -1903,6 +1996,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Webhook
+    #[cfg(feature = "webhook")]
     if let Some(ref wh_config) = config.webhook {
         if let Some(secret) = read_token(&wh_config.secret_env, "Webhook") {
             let adapter = Arc::new(WebhookAdapter::new(
@@ -1915,6 +2009,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // LinkedIn
+    #[cfg(feature = "linkedin")]
     if let Some(ref li_config) = config.linkedin {
         if let Some(token) = read_token(&li_config.access_token_env, "LinkedIn") {
             let adapter = Arc::new(LinkedInAdapter::new(
@@ -1926,6 +2021,7 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // MQTT
+    #[cfg(feature = "mqtt")]
     if let Some(ref mq_config) = config.mqtt {
         let username = read_token(&mq_config.username_env, "MQTT (username)");
         let password = read_token(&mq_config.password_env, "MQTT (password)");

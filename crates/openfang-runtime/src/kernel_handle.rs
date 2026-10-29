@@ -142,6 +142,59 @@ pub trait KernelHandle: Send + Sync {
         false
     }
 
+    /// Check if a shell command matches the policy's `deny_shell` hard floor.
+    ///
+    /// A `true` result BLOCKS execution unconditionally — before approvals,
+    /// before `auto_approve_shell` exemptions, before exec-policy bypass.
+    /// Default: `false` — no floor configured.
+    fn shell_denied(&self, command: &str) -> bool {
+        let _ = command;
+        false
+    }
+
+    /// Full-text search across past conversations (all sessions, all agents).
+    ///
+    /// Returns an array of hits: `{session_id, agent_id, role, content,
+    /// created_at, session_label}` ordered by bm25 relevance. Default: empty.
+    fn session_search(&self, query: &str, limit: usize) -> Vec<serde_json::Value> {
+        let _ = (query, limit);
+        Vec::new()
+    }
+
+    /// Known chat channels (learned from traffic + operator aliases).
+    ///
+    /// Returns rendered lines: `- discord #taau → 1234 (observed, seen ...)`.
+    fn channel_directory(&self, channel_type: Option<&str>) -> String {
+        let _ = channel_type;
+        String::new()
+    }
+
+    /// Take any user messages queued while this agent turn was running.
+    ///
+    /// The agent loop calls this at each iteration boundary; returned texts
+    /// are appended as user turns so a running task can be corrected or
+    /// extended without waiting for it to finish ("actually use the other
+    /// file"). Default: none queued.
+    fn take_steering(&self, agent_id: &str) -> Vec<String> {
+        let _ = agent_id;
+        Vec::new()
+    }
+
+    /// Run a Python script in the agent's persistent code kernel, letting the
+    /// script call tools via `call_tool(name, **kwargs)`.
+    ///
+    /// Returns the script's stdout, or a formatted `[error]` block when the
+    /// script raised. Default: unsupported (kernels live in the kernel crate).
+    async fn code_execute(
+        &self,
+        agent_id: &str,
+        session_key: &str,
+        code: &str,
+    ) -> Result<String, String> {
+        let _ = (agent_id, session_key, code);
+        Err("code_execute is not available on this kernel".to_string())
+    }
+
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
     /// Returns `Ok(true)` if approved, `Ok(false)` if denied or timed out.
     async fn request_approval(

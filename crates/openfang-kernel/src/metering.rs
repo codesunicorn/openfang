@@ -182,28 +182,106 @@ impl MeteringEngine {
     /// | command-r-plus        |     2.50  |     10.00  |
     /// | Default (unknown)     |     1.00  |      3.00  |
     pub fn estimate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
+        Self::estimate_cost_with_cache(model, input_tokens, output_tokens, 0, 0)
+    }
+
+    /// Estimate cost accounting for prompt-cache discounts.
+    ///
+    /// Cache reads are billed at a fraction of the input rate (Anthropic:
+    /// 10%, OpenAI: 50%); Anthropic bills 5-minute cache writes at 1.25x.
+    /// Cache token counts are subsets of `input_tokens` (drivers normalize
+    /// to that semantics), so the calculation prices them at the discounted
+    /// rate instead of the full input rate.
+    pub fn estimate_cost_with_cache(
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> f64 {
         let model_lower = model.to_lowercase();
         let (input_per_m, output_per_m) = estimate_cost_rates(&model_lower);
 
-        let input_cost = (input_tokens as f64 / 1_000_000.0) * input_per_m;
-        let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
+        let cache_read = cache_read_tokens.min(input_tokens) as f64;
+        let cache_creation = cache_creation_tokens.min(input_tokens) as f64;
+        let full_price_input = (input_tokens as f64 - cache_read - cache_creation).max(0.0);
+
+        let (read_factor, write_factor) = if model_lower.contains("claude")
+            || model_lower.contains("anthropic")
+            || model_lower.contains("haiku")
+            || model_lower.contains("opus")
+            || model_lower.contains("sonnet")
+        {
+            (0.10, 1.25)
+        } else {
+            // OpenAI-compatible caches are billed at 50% for reads; writes
+            // are not billed separately.
+            (0.50, 1.0)
+        };
+
+        let per_m = |tokens: f64, rate: f64| (tokens / 1_000_000.0) * rate;
+        let input_cost = per_m(full_price_input, input_per_m)
+            + per_m(cache_read, input_per_m * read_factor)
+            + per_m(cache_creation, input_per_m * write_factor);
+        let output_cost = per_m(output_tokens as f64, output_per_m);
         input_cost + output_cost
     }
 
     /// Estimate cost using the model catalog as the pricing source.
     ///
     /// Falls back to the default rate ($1/$3 per million) if the model is not
-    /// found in the catalog.
+    /// found in the catalog. Applies prompt-cache discounts the same way as
+    /// [`Self::estimate_cost_with_cache`].
     pub fn estimate_cost_with_catalog(
         catalog: &openfang_runtime::model_catalog::ModelCatalog,
         model: &str,
         input_tokens: u64,
         output_tokens: u64,
     ) -> f64 {
+        Self::estimate_cost_with_catalog_cached(
+            catalog,
+            model,
+            input_tokens,
+            output_tokens,
+            0,
+            0,
+        )
+    }
+
+    /// Cache-aware variant of [`Self::estimate_cost_with_catalog`].
+    pub fn estimate_cost_with_catalog_cached(
+        catalog: &openfang_runtime::model_catalog::ModelCatalog,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> f64 {
         let (input_per_m, output_per_m) = catalog.pricing(model).unwrap_or((1.0, 3.0));
-        let input_cost = (input_tokens as f64 / 1_000_000.0) * input_per_m;
-        let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
-        input_cost + output_cost
+        let model_lower = model.to_lowercase();
+
+        let cache_read = cache_read_tokens.min(input_tokens) as f64;
+        let cache_creation = cache_creation_tokens.min(input_tokens) as f64;
+        let full_price_input = (input_tokens as f64 - cache_read - cache_creation).max(0.0);
+
+        // Catalog pricing carries no provider column, so key the discount off
+        // the model name (same heuristic as the hardcoded-rate path).
+        let (read_factor, write_factor) = if model_lower.contains("claude")
+            || model_lower.contains("anthropic")
+            || model_lower.contains("haiku")
+            || model_lower.contains("opus")
+            || model_lower.contains("sonnet")
+        {
+            (0.10, 1.25)
+        } else {
+            (0.50, 1.0)
+        };
+
+        let per_m = |tokens: f64, rate: f64| (tokens / 1_000_000.0) * rate;
+        per_m(full_price_input, input_per_m)
+            + per_m(cache_read, input_per_m * read_factor)
+            + per_m(cache_creation, input_per_m * write_factor)
+            + per_m(output_tokens as f64, output_per_m)
     }
 
     /// Clean up old usage records.
@@ -543,6 +621,8 @@ mod tests {
                 model: "claude-haiku".to_string(),
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.001,
                 tool_calls: 0,
             })
@@ -566,6 +646,8 @@ mod tests {
                 model: "claude-sonnet".to_string(),
                 input_tokens: 10000,
                 output_tokens: 5000,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.05,
                 tool_calls: 0,
             })
@@ -593,6 +675,8 @@ mod tests {
                 model: "claude-opus".to_string(),
                 input_tokens: 100000,
                 output_tokens: 50000,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 100.0,
                 tool_calls: 0,
             })
@@ -803,6 +887,8 @@ mod tests {
                 model: "haiku".to_string(),
                 input_tokens: 500,
                 output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 cost_usd: 0.005,
                 tool_calls: 3,
             })

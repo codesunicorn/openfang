@@ -38,7 +38,7 @@ api_key_env = "GROQ_API_KEY"
 [resources]
 
 [capabilities]
-tools = ["file_read", "file_list", "memory_store", "memory_recall", "agent_send"]
+tools = ["file_read", "file_list", "memory_store", "memory_recall", "agent_send", "code_execute"]
 memory_read = ["*"]
 memory_write = ["self.*", "shared.*"]
 agent_message = ["*"]

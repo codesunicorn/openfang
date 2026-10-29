@@ -150,6 +150,18 @@ pub struct OpenFangKernel {
     pub hooks: openfang_runtime::hooks::HookRegistry,
     /// Persistent process manager for interactive sessions (REPLs, servers).
     pub process_manager: Arc<openfang_runtime::process_manager::ProcessManager>,
+    /// Persistent per-session Python interpreters backing the `code_execute`
+    /// tool (see `crate::code_kernel`).
+    pub code_kernel: Arc<crate::code_kernel::CodeKernelManager>,
+    /// Agents currently mid-turn on the non-streaming path (streaming uses
+    /// `running_tasks`). Guarded by `RunningTurnGuard`.
+    pub running_turns: dashmap::DashMap<AgentId, ()>,
+    /// Steering messages queued while an agent turn is running, keyed by
+    /// agent id. Drained by the agent loop at its next iteration boundary.
+    pub steering_queue: dashmap::DashMap<AgentId, Vec<String>>,
+    /// Learned name→id map of reachable chat channels (see
+    /// `crate::channel_directory`).
+    pub channel_directory: Arc<crate::channel_directory::ChannelDirectory>,
     /// OFP peer registry — tracks connected peers (OnceLock for safe init after Arc creation).
     pub peer_registry: OnceLock<openfang_wire::PeerRegistry>,
     /// OFP peer node — the local networking node (OnceLock for safe init after Arc creation).
@@ -638,6 +650,7 @@ impl OpenFangKernel {
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| KernelError::BootFailed(format!("Failed to create data dir: {e}")))?;
+        let channel_directory_dir = config.data_dir.clone();
 
         // Initialize memory substrate
         let db_path = config
@@ -825,8 +838,21 @@ impl OpenFangKernel {
             info!("RBAC enabled with {} users", auth.user_count());
         }
 
-        // Initialize model catalog, detect provider auth, and apply URL overrides
-        let mut model_catalog = openfang_runtime::model_catalog::ModelCatalog::new();
+        // Initialize model catalog. Prefer the operator-editable data file
+        // (models.json in the data dir); first boot writes the compiled-in
+        // catalog out as JSON so model/price updates become data edits rather
+        // than rebuilds. Malformed files fall back to the compiled tables.
+        let models_json = config.data_dir.join("models.json");
+        if !models_json.exists() {
+            let generated = openfang_runtime::model_catalog::builtin_catalog_json();
+            if let Err(e) = std::fs::write(&models_json, generated) {
+                warn!(error = %e, "could not write models.json; using compiled-in catalog");
+            } else {
+                info!(path = %models_json.display(), "Wrote default model catalog data file");
+            }
+        }
+        let mut model_catalog =
+            openfang_runtime::model_catalog::ModelCatalog::from_json_dir(&models_json);
         model_catalog.detect_auth();
         // Env-var overrides for local providers (OLLAMA_HOST, LMSTUDIO_BASE_URL, etc.).
         // Applied before `provider_urls` so explicit config.toml entries win. See #1154.
@@ -1223,6 +1249,21 @@ impl OpenFangKernel {
             auto_reply_engine,
             hooks: openfang_runtime::hooks::HookRegistry::new(),
             process_manager: Arc::new(openfang_runtime::process_manager::ProcessManager::new(5)),
+            running_turns: dashmap::DashMap::new(),
+            steering_queue: dashmap::DashMap::new(),
+            channel_directory: Arc::new(crate::channel_directory::ChannelDirectory::load(
+                &channel_directory_dir,
+            )),
+            code_kernel: Arc::new(crate::code_kernel::CodeKernelManager::new(
+                std::env::var("OPENFANG_PYTHON").unwrap_or_else(|_| "python3".to_string()),
+                None,
+                std::time::Duration::from_secs(
+                    std::env::var("OPENFANG_CODE_EXECUTE_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(120),
+                ),
+            )),
             peer_registry: OnceLock::new(),
             peer_node: OnceLock::new(),
             booted_at: std::time::Instant::now(),
@@ -2002,6 +2043,15 @@ impl OpenFangKernel {
             .clone();
         let _guard = lock.lock().await;
 
+        // Mark the turn as running so `is_agent_running()` is true on this
+        // (non-streaming) path too — otherwise a steer request would start a
+        // competing turn instead of queueing. Removed by the guard below.
+        self.running_turns.insert(agent_id, ());
+        let _turn_guard = RunningTurnGuard {
+            kernel: self,
+            agent_id,
+        };
+
         // Enforce quota before running the agent loop
         self.scheduler
             .check_quota(agent_id)
@@ -2545,7 +2595,7 @@ impl OpenFangKernel {
 
                     // Persist usage to database (same as non-streaming path)
                     let model = &manifest.model.model;
-                    let cost = MeteringEngine::estimate_cost_with_catalog(
+                    let cost = MeteringEngine::estimate_cost_with_catalog_cached(
                         &kernel_clone
                             .model_catalog
                             .read()
@@ -2553,6 +2603,8 @@ impl OpenFangKernel {
                         model,
                         result.total_usage.input_tokens,
                         result.total_usage.output_tokens,
+                        result.total_usage.cache_read_tokens,
+                        result.total_usage.cache_creation_tokens,
                     );
                     let _ = kernel_clone
                         .metering
@@ -2561,6 +2613,8 @@ impl OpenFangKernel {
                             model: model.clone(),
                             input_tokens: result.total_usage.input_tokens,
                             output_tokens: result.total_usage.output_tokens,
+                            cache_read_tokens: result.total_usage.cache_read_tokens,
+                            cache_creation_tokens: result.total_usage.cache_creation_tokens,
                             cost_usd: cost,
                             tool_calls: result.iterations.saturating_sub(1),
                         });
@@ -2682,8 +2736,7 @@ impl OpenFangKernel {
             response,
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens: 0,
-                output_tokens: 0,
-            },
+                output_tokens: 0, ..Default::default() },
             iterations: 1,
             cost_usd: None,
             silent: false,
@@ -2742,8 +2795,7 @@ impl OpenFangKernel {
             response: result.response,
             total_usage: openfang_types::message::TokenUsage {
                 input_tokens: 0,
-                output_tokens: 0,
-            },
+                output_tokens: 0, ..Default::default() },
             cost_usd: None,
             iterations: 1,
             silent: false,
@@ -3125,17 +3177,21 @@ impl OpenFangKernel {
 
         // Record usage in the metering engine (uses catalog pricing as single source of truth)
         let model = &manifest.model.model;
-        let cost = MeteringEngine::estimate_cost_with_catalog(
+        let cost = MeteringEngine::estimate_cost_with_catalog_cached(
             &self.model_catalog.read().unwrap_or_else(|e| e.into_inner()),
             model,
             result.total_usage.input_tokens,
             result.total_usage.output_tokens,
+            result.total_usage.cache_read_tokens,
+            result.total_usage.cache_creation_tokens,
         );
         let _ = self.metering.record(&openfang_memory::usage::UsageRecord {
             agent_id,
             model: model.clone(),
             input_tokens: result.total_usage.input_tokens,
             output_tokens: result.total_usage.output_tokens,
+            cache_read_tokens: result.total_usage.cache_read_tokens,
+            cache_creation_tokens: result.total_usage.cache_creation_tokens,
             cost_usd: cost,
             tool_calls: result.iterations.saturating_sub(1),
         });
@@ -3668,6 +3724,37 @@ impl OpenFangKernel {
         );
 
         Ok((input_tokens, output_tokens, cost))
+    }
+
+    /// True when the agent is mid-turn (a run task is registered).
+    pub fn is_agent_running(&self, agent_id: AgentId) -> bool {
+        self.running_tasks.contains_key(&agent_id) || self.running_turns.contains_key(&agent_id)
+    }
+
+    /// Queue a steering message for a running agent turn.
+    ///
+    /// The agent loop drains the queue at its next iteration boundary and
+    /// appends the text as a user turn, so a long task can be corrected
+    /// without cancelling it. Returns `false` when no turn is running (the
+    /// message should be delivered as a normal new turn instead).
+    pub fn queue_steering(&self, agent_id: AgentId, message: &str) -> bool {
+        if !self.is_agent_running(agent_id) {
+            return false;
+        }
+        let text = message.trim();
+        if text.is_empty() {
+            return false;
+        }
+        self.steering_queue
+            .entry(agent_id)
+            .or_default()
+            .push(text.to_string());
+        info!(
+            agent_id = %agent_id,
+            chars = text.chars().count(),
+            "Steering message queued for running turn"
+        );
+        true
     }
 
     /// Cancel an agent's currently running LLM task.
@@ -6536,22 +6623,29 @@ impl OpenFangKernel {
         if skills.is_empty() {
             return String::new();
         }
+        // Progressive disclosure: this index is injected into the system
+        // prompt on EVERY turn, so it stays one truncated line per skill.
+        // Full instructions, tool lists and examples live in the SKILL.md
+        // bodies and are fetched on demand via `skill_describe` — with 60+
+        // installed skills, inlining descriptions + tool lists cost more
+        // tokens per turn than the task itself.
+        const INDEX_DESC_CHARS: usize = 90;
         let mut summary = format!("\n\n--- Available Skills ({}) ---\n", skills.len());
         for skill in &skills {
             let name = &skill.manifest.skill.name;
-            let desc = &skill.manifest.skill.description;
-            let tools: Vec<_> = skill
+            let desc: String = skill
                 .manifest
-                .tools
-                .provided
-                .iter()
-                .map(|t| t.name.as_str())
+                .skill
+                .description
+                .chars()
+                .take(INDEX_DESC_CHARS)
                 .collect();
-            if tools.is_empty() {
-                summary.push_str(&format!("- {name}: {desc}\n"));
+            let ellipsis = if skill.manifest.skill.description.chars().count() > INDEX_DESC_CHARS {
+                "…"
             } else {
-                summary.push_str(&format!("- {name}: {desc} [tools: {}]\n", tools.join(", ")));
-            }
+                ""
+            };
+            summary.push_str(&format!("- {name}: {desc}{ellipsis}\n"));
         }
         // Issue #1038: skill directories (e.g. ~/.openfang/skills/) live OUTSIDE
         // the workspace sandbox. Tell the agent to use the dedicated skill_*
@@ -7243,6 +7337,19 @@ impl openfang_channels::bridge::ChannelBridgeHandle for KernelCronBridge {
     }
 }
 
+/// Removes an agent from `running_turns` when the turn finishes (including on
+/// cancellation/panic), so `is_agent_running` cannot go stale.
+struct RunningTurnGuard<'a> {
+    kernel: &'a OpenFangKernel,
+    agent_id: AgentId,
+}
+
+impl Drop for RunningTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.kernel.running_turns.remove(&self.agent_id);
+    }
+}
+
 /// Fan out `output` to every target in `delivery_targets` concurrently.
 ///
 /// Never returns an error — delivery is best-effort because the job itself
@@ -7706,6 +7813,113 @@ impl KernelHandle for OpenFangKernel {
         self.approval_manager
             .policy()
             .shell_auto_approved(command)
+    }
+
+    fn shell_denied(&self, command: &str) -> bool {
+        self.approval_manager.policy().shell_denied(command)
+    }
+
+    fn channel_directory(&self, channel_type: Option<&str>) -> String {
+        self.channel_directory.render(channel_type)
+    }
+
+    fn take_steering(&self, agent_id: &str) -> Vec<String> {
+        let Ok(id) = agent_id.parse::<AgentId>() else {
+            return Vec::new();
+        };
+        self.steering_queue
+            .remove(&id)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    async fn code_execute(
+        &self,
+        agent_id: &str,
+        session_key: &str,
+        code: &str,
+    ) -> Result<String, String> {
+        // Nested tool calls from inside the script go through the exact same
+        // execute_tool path as top-level calls, so workspace sandboxing, file
+        // restrictions and the shell deny floor all still apply.
+        let agent = agent_id.parse::<AgentId>().ok();
+        let manifest = agent.and_then(|id| self.registry.get(id)).map(|e| e.manifest.clone());
+        let allowed_tools = manifest
+            .as_ref()
+            .map(|m| m.capabilities.tools.clone())
+            .filter(|t| !t.is_empty());
+        let workspace_root = manifest.as_ref().and_then(|m| m.workspace.clone());
+
+        let kernel: Arc<dyn KernelHandle> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>)
+            .ok_or_else(|| "code_execute requires the kernel handle to be initialised".to_string())?;
+        let registry: Option<Arc<openfang_skills::registry::SkillRegistry>> = self
+            .skill_registry
+            .read()
+            .ok()
+            .map(|r| Arc::new(r.snapshot()));
+        let dispatch = move |name: String, input: serde_json::Value| {
+            let kernel = Arc::clone(&kernel);
+            let allowed_tools = allowed_tools.clone();
+            let workspace_root = workspace_root.clone();
+            let registry = registry.clone();
+            async move {
+                let result = openfang_runtime::tool_runner::execute_tool(
+                    "nested",
+                    &name,
+                    &input,
+                    Some(&kernel),
+                    allowed_tools.as_deref(),
+                    None,
+                    registry.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace_root.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                if result.is_error {
+                    Err(result.content)
+                } else {
+                    Ok(result.content)
+                }
+            }
+        };
+
+        self.code_kernel
+            .execute(session_key, code, dispatch)
+            .await
+    }
+
+    fn session_search(&self, query: &str, limit: usize) -> Vec<serde_json::Value> {
+        match self.memory.search_messages(query, limit) {
+            Ok(hits) => hits
+                .into_iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "session_id": h.session_id,
+                        "agent_id": h.agent_id,
+                        "role": h.role,
+                        "content": h.content,
+                        "created_at": h.created_at,
+                        "session_label": h.session_label,
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "session_search failed");
+                Vec::new()
+            }
+        }
     }
 
     async fn request_approval(

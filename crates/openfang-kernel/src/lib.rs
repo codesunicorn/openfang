@@ -8,6 +8,8 @@ pub mod auth;
 pub mod auto_reply;
 pub mod background;
 pub mod capabilities;
+pub mod channel_directory;
+pub mod code_kernel;
 pub mod config;
 pub mod config_reload;
 pub mod cron;

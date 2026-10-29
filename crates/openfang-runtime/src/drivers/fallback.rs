@@ -146,8 +146,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage {
                     input_tokens: 10,
-                    output_tokens: 5,
-                },
+                    output_tokens: 5, ..Default::default() },
             })
         }
     }

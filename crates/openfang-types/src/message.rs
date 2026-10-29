@@ -322,11 +322,19 @@ pub enum StopReason {
 
 /// Token usage information from an LLM call.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TokenUsage {
     /// Tokens used for the input/prompt.
     pub input_tokens: u64,
     /// Tokens generated in the output.
     pub output_tokens: u64,
+    /// Input tokens served from the provider's prompt cache. Semantics are
+    /// normalized at the driver level: a subset of `input_tokens`, billed at
+    /// a discount (Anthropic: 10% of input price, OpenAI: 50%).
+    pub cache_read_tokens: u64,
+    /// Input tokens written to the provider's prompt cache (subset of
+    /// `input_tokens`; Anthropic bills 5-minute cache writes at 1.25x input).
+    pub cache_creation_tokens: u64,
 }
 
 impl TokenUsage {
@@ -370,8 +378,7 @@ mod tests {
     fn test_token_usage() {
         let usage = TokenUsage {
             input_tokens: 100,
-            output_tokens: 50,
-        };
+            output_tokens: 50, ..Default::default() };
         assert_eq!(usage.total(), 150);
     }
 

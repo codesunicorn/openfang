@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -324,6 +328,78 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (8, datetime('now'), 'Add audit_entries table for persistent Merkle audit trail');
         ",
+    )?;
+    Ok(())
+}
+
+
+/// Version 9: prompt-cache token columns on usage_events + messages FTS5 index.
+///
+/// - `cache_read_tokens` / `cache_creation_tokens` are subsets of
+///   `input_tokens`; the metering engine applies provider cache discounts
+///   when estimating spend.
+/// - `messages_fts` (FTS5, external-content triggers) powers session search
+///   across all past conversations.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    for (table, column, ddl) in [
+        (
+            "usage_events",
+            "cache_read_tokens",
+            "ALTER TABLE usage_events ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "usage_events",
+            "cache_creation_tokens",
+            "ALTER TABLE usage_events ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !column_exists(conn, table, column) {
+            conn.execute_batch(ddl)?;
+        }
+    }
+
+    // Searchable per-message mirror of the session blobs. Sessions store
+    // messages as a msgpack BLOB (schema v1) — not queryable. This table
+    // is synced wholesale by `save_session` (delete + reinsert the session's
+    // rows), which keeps compaction/deletion consistent, and the FTS
+    // triggers below keep the full-text index in sync with the table.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            content,
+            session_id UNINDEXED,
+            agent_id UNINDEXED,
+            role UNINDEXED,
+            created_at UNINDEXED,
+            tokenize = 'porter unicode61'
+        );
+        CREATE TRIGGER IF NOT EXISTS messages_fts_ins AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts (rowid, content, session_id, agent_id, role, created_at)
+            VALUES (new.id, new.content, new.session_id, new.agent_id, new.role, new.created_at);
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_fts_del AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_fts_upd AFTER UPDATE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+            INSERT INTO messages_fts (rowid, content, session_id, agent_id, role, created_at)
+            VALUES (new.id, new.content, new.session_id, new.agent_id, new.role, new.created_at);
+        END;",
+    )?;
+
+    conn.execute(
+        "INSERT INTO migrations (version, applied_at, description)
+         VALUES (9, datetime('now'), 'usage cache-token columns + messages FTS5 index')",
+        [],
     )?;
     Ok(())
 }

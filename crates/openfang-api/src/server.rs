@@ -571,6 +571,7 @@ pub async fn build_router(
         )
         // Session endpoints
         .route("/api/sessions", axum::routing::get(routes::list_sessions))
+        .route("/api/sessions/search", axum::routing::get(routes::search_sessions))
         .route(
             "/api/sessions/{id}",
             axum::routing::delete(routes::delete_session),
