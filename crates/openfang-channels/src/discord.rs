@@ -804,6 +804,51 @@ impl ChannelAdapter for DiscordAdapter {
                                             .to_string();
 
                                         if !custom_id.is_empty() {
+                                            let (action_label, verb) =
+                                                match custom_id.split_once(':') {
+                                                    Some(("approve", _)) => ("✅", "Approving"),
+                                                    Some(("deny", _)) => ("⛔", "Denying"),
+                                                    _ => ("⏳", "Working"),
+                                                };
+
+                                            // Respond with type 7 (UPDATE_MESSAGE)
+                                            // IMMEDIATELY: this replaces the prompt
+                                            // in-place and removes the buttons, so
+                                            // (a) the tap feels instant and (b) the
+                                            // same prompt cannot be clicked twice.
+                                            //
+                                            // Type 6 (deferred update) was the bug
+                                            // behind "why do I have to tap twice?":
+                                            // it shows the user nothing and requires
+                                            // a follow-up webhook edit that we never
+                                            // sent, so the button looked dead for the
+                                            // full watcher poll interval.
+                                            if !interaction_id.is_empty()
+                                                && !token.is_empty()
+                                            {
+                                                let original = d["message"]["content"]
+                                                    .as_str()
+                                                    .unwrap_or("");
+                                                let client = reqwest::Client::new();
+                                                let url = format!(
+                                                    "{DISCORD_API_BASE}/interactions/{interaction_id}/{token}/callback"
+                                                );
+                                                let _ = client
+                                                    .post(&url)
+                                                    .json(&serde_json::json!({
+                                                        "type": 7,
+                                                        "data": {
+                                                            "content": format!(
+                                                                "{original}\n\n{action_label} _{verb}… (by {user_name})_"
+                                                            ),
+                                                            // Empty components = buttons gone.
+                                                            "components": [],
+                                                        }
+                                                    }))
+                                                    .send()
+                                                    .await;
+                                            }
+
                                             pending_interactions.lock().await.push(
                                                 ComponentInteraction {
                                                     custom_id,
@@ -811,22 +856,12 @@ impl ChannelAdapter for DiscordAdapter {
                                                     channel_id,
                                                     user_id,
                                                     user_name,
+                                                    message_content: d["message"]["content"]
+                                                        .as_str()
+                                                        .unwrap_or("")
+                                                        .to_string(),
                                                 },
                                             );
-                                            // ACK so the click feels instant.
-                                            if !interaction_id.is_empty()
-                                                && !token.is_empty()
-                                            {
-                                                let client = reqwest::Client::new();
-                                                let url = format!(
-                                                    "{DISCORD_API_BASE}/interactions/{interaction_id}/{token}/callback"
-                                                );
-                                                let _ = client
-                                                    .post(&url)
-                                                    .json(&serde_json::json!({"type": 6}))
-                                                    .send()
-                                                    .await;
-                                            }
                                             info!("Discord component click queued");
                                         }
                                     }

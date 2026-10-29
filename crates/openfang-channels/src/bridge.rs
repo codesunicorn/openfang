@@ -592,7 +592,10 @@ impl BridgeManager {
                 let mut last_target: Option<(String, String)> = None;
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        // 2s: approvals are time-sensitive (default window is
+                        // short) and the click has already been ACKed by the
+                        // adapter, so this only controls verdict latency.
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                         _ = shutdown_btn.changed() => {
                             if *shutdown_btn.borrow() { break; }
                             continue;
@@ -614,11 +617,20 @@ impl BridgeManager {
                             display_name: click.user_name.clone(),
                             openfang_user: None,
                         };
-                        let verdict = if approve { "approved" } else { "denied" };
-                        let line = format!(
-                            "**{verdict}** by {} — {result}",
-                            click.user_name
-                        );
+                        let (icon, verdict) = if approve {
+                            ("✅", "approved")
+                        } else {
+                            ("⛔", "denied")
+                        };
+                        // Keep the original prompt text; append the verdict.
+                        let line = if click.message_content.trim().is_empty() {
+                            format!("{icon} **{verdict}** by {} — {result}", click.user_name)
+                        } else {
+                            format!(
+                                "{}\n\n{icon} **{verdict}** by {} — {result}",
+                                click.message_content, click.user_name
+                            )
+                        };
                         // Replace the buttons so it can't be clicked twice.
                         let _ = adapter_btn
                             .resolve_button_message(

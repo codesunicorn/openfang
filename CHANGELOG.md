@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Discord approval buttons now acknowledge instantly with interaction type 7 (UPDATE_MESSAGE): the prompt is replaced in place and the buttons removed on tap — no more "tap twice" or re-clicking the same prompt. Verdict lines keep the original prompt text (component interactions now carry `message_content`), verdict latency dropped 5s → 2s, and clicking an expired prompt replies "That approval expired (window: Ns) or was already decided." instead of implying the id was wrong.
+
 ## [0.5.10] - 2026-04-17
 
 ### Fixed

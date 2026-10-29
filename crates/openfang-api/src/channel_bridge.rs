@@ -835,7 +835,16 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .filter(|r| r.id.to_string().starts_with(id_prefix))
             .collect();
         match matched.len() {
-            0 => format!("No pending approval matching '{id_prefix}'."),
+            0 => {
+                // Most common cause on Discord: the prompt sat longer than the
+                // approval window, so the request auto-timed-out before the
+                // click landed. Say that plainly instead of implying the id
+                // was wrong.
+                let window = self.kernel.approval_manager.policy().timeout_secs;
+                format!(
+                    "That approval expired (window: {window}s) or was already decided."
+                )
+            }
             1 => {
                 let req = matched[0];
                 let decision = if approve {

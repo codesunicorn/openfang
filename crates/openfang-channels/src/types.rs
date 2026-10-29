@@ -261,6 +261,10 @@ pub struct ComponentInteraction {
     pub user_id: String,
     /// Display name of the clicker, for confirmation text.
     pub user_name: String,
+    /// Original message text at click time, so the final edit can keep the
+    /// prompt visible instead of replacing it with a bare verdict line.
+    #[serde(default)]
+    pub message_content: String,
 }
 
 /// Bridge-level view of kernel streaming events (crate-neutral mirror of
