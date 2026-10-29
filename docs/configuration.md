@@ -1467,12 +1467,14 @@ Only Discord, Telegram, Slack and Matrix compile by default. The other 36
 adapters are behind per-adapter Cargo features:
 
 ```bash
-cargo build --release -p openfang-cli                      # core four
-cargo build --release -p openfang-cli --features full-channels   # everything
+cargo build --release -p openfang-cli                       # everything (default)
+cargo build --release -p openfang-cli --no-default-features --features core-channels   # core four
 ```
 
-`openfang-api` enables `full-channels` by default, so release builds keep every
-adapter unless you opt out with `--no-default-features`.
+`openfang-cli` and `openfang-desktop` enable `full-channels` by default, so
+normal release builds keep every adapter. `openfang-channels`/`openfang-api`
+default to the core four, which makes the slim build a real ~20MB (3.2x)
+reduction in the channels crate rather than a no-op.
 
 ## Bundled agents
 

@@ -35,6 +35,19 @@ listen_addr = "127.0.0.1:4200"           # OFP listen address
 # Usage tracking display
 # usage_footer = "Full"                   # "Off", "Tokens", "Cost", or "Full"
 
+# Approval policy for tool execution
+# [approval]
+# require_approval = ["shell_exec"]      # Tools that always ask first (bool shorthand: false = none)
+# timeout_secs = 60                      # Wait for a human decision before auto-deny (10-300)
+# auto_approve_autonomous = false        # Autonomous (cron/event) runs bypass the prompt
+#
+# Read-only commands can skip the prompt by pattern:
+# auto_approve_shell = ["uptime", "df *", "free *", "systemctl status *"]
+#
+# Hard floor: these NEVER run, regardless of approvals, exemptions or exec policy.
+# Matched on the deobfuscated command, so quoting tricks (r\\m, st""us) do not slip past.
+# deny_shell = ["rm -rf /", "mkfs *", "mkfs.*", "dd if=*", "shutdown *", ":(){ *"]
+
 # Channel adapters (configure tokens via environment variables)
 # [telegram]
 # bot_token_env = "TELEGRAM_BOT_TOKEN"

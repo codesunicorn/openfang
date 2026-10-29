@@ -10,7 +10,7 @@ openfang-types = { path = "../openfang-types" }
 openfang-kernel = { path = "../openfang-kernel" }
 openfang-runtime = { path = "../openfang-runtime" }
 openfang-memory = { path = "../openfang-memory" }
-openfang-channels = { path = "../openfang-channels" }
+openfang-channels = { path = "../openfang-channels", default-features = false }
 openfang-wire = { path = "../openfang-wire" }
 openfang-skills = { path = "../openfang-skills" }
 openfang-hands = { path = "../openfang-hands" }
@@ -47,7 +47,9 @@ tempfile = { workspace = true }
 uuid = { workspace = true }
 
 [features]
-default = ["full-channels"]
+# Default: core four adapters only (Discord/Telegram/Slack/Matrix).
+# `full-channels` adds the other 36; the CLI and desktop binaries enable it.
+default = []
 full-channels = ["email", "google_chat", "irc", "mattermost", "rocketchat", "signal", "teams", "twitch", "whatsapp", "xmpp", "zulip", "bluesky", "feishu", "line", "mastodon", "messenger", "reddit", "revolt", "viber", "flock", "guilded", "keybase", "nextcloud", "nostr", "pumble", "threema", "twist", "webex", "dingtalk", "dingtalk_stream", "discourse", "gitter", "gotify", "linkedin", "mumble", "mqtt", "ntfy", "webhook", "wecom"]
 email = ["openfang-channels/email"]
 google_chat = ["openfang-channels/google_chat"]

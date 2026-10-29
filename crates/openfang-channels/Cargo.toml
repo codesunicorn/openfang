@@ -45,6 +45,7 @@ tokio-test = { workspace = true }
 
 [features]
 default = ["discord", "telegram", "slack", "matrix"]
+# NOTE: api/cli forward per-adapter features; the four above are the guaranteed core.
 all = ["bluesky", "dingtalk", "dingtalk_stream", "discourse", "email", "feishu", "flock", "gitter", "google_chat", "gotify", "guilded", "irc", "keybase", "line", "linkedin", "mastodon", "mattermost", "messenger", "mumble", "nextcloud", "nostr", "ntfy", "pumble", "reddit", "revolt", "rocketchat", "signal", "teams", "threema", "twist", "twitch", "viber", "webex", "webhook", "wecom", "whatsapp", "xmpp", "zulip", "mqtt"]
 discord = []
 matrix = []

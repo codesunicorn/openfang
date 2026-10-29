@@ -32,3 +32,11 @@ uuid = { workspace = true }
 ratatui = { workspace = true }
 colored = { workspace = true }
 tempfile = { workspace = true }
+
+[features]
+# Every channel adapter (default: unchanged behaviour).
+default = ["full-channels"]
+full-channels = ["openfang-api/full-channels"]
+# Slim binary: Discord/Telegram/Slack/Matrix only. Requires building with
+# `--no-default-features --features core-channels`.
+core-channels = []
