@@ -341,15 +341,14 @@ pub async fn send_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+            ).into_response();        }
     };
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
@@ -358,7 +357,7 @@ pub async fn send_message(
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
-        );
+        ).into_response();
     }
 
     // Check agent exists before processing
@@ -366,7 +365,7 @@ pub async fn send_message(
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Agent not found"})),
-        );
+        ).into_response();
     }
 
     // Resolve file attachments into image content blocks.
@@ -395,12 +394,11 @@ pub async fn send_message(
                     "steered": true,
                     "response": "Steering message queued for the running turn.",
                 })),
-            );
-        }
+            ).into_response();        }
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    match state
+    let outcome = state
         .kernel
         .send_message_with_handle_and_blocks(
             agent_id,
@@ -410,8 +408,8 @@ pub async fn send_message(
             req.sender_id,
             req.sender_name,
         )
-        .await
-    {
+        .await;
+    match outcome {
         Ok(result) => {
             // Strip <think>...</think> blocks from model output
             let cleaned = crate::ws::strip_think_tags(&result.response);
@@ -439,21 +437,46 @@ pub async fn send_message(
                     iterations: result.iterations,
                     cost_usd: result.cost_usd,
                 })),
-            )
+            ).into_response()
         }
         Err(e) => {
             tracing::warn!("send_message failed for agent {id}: {e}");
-            let status = if format!("{e}").contains("Agent not found") {
-                StatusCode::NOT_FOUND
-            } else if format!("{e}").contains("quota") || format!("{e}").contains("Quota") {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+            // Match on the typed error where we have one — string sniffing
+            // breaks the moment a message is reworded, and "busy" is a
+            // retryable condition the client must be able to distinguish.
+            let mut busy = false;
+            let status = match e {
+                openfang_kernel::error::KernelError::OpenFang(ref inner) => match inner {
+                    openfang_types::error::OpenFangError::AgentNotFound(_) => {
+                        StatusCode::NOT_FOUND
+                    }
+                    openfang_types::error::OpenFangError::AgentBusy { .. } => {
+                        busy = true;
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                    openfang_types::error::OpenFangError::TurnTimeout { .. } => {
+                        // Gateway timeout: the turn itself blew its budget.
+                        StatusCode::GATEWAY_TIMEOUT
+                    }
+                    _ if format!("{inner}").contains("uota") => StatusCode::TOO_MANY_REQUESTS,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                },
+                _ if format!("{e}").contains("uota") => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            (
-                status,
-                Json(serde_json::json!({"error": format!("Message delivery failed: {e}")})),
-            )
+            let body = Json(serde_json::json!({
+                "error": format!("Message delivery failed: {e}"),
+                "busy": busy,
+                "retryable": busy,
+            }));
+            let mut resp = (status, body).into_response();
+            if busy {
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("10"),
+                );
+            }
+            return resp;
         }
     }
 }

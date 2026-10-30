@@ -1140,6 +1140,14 @@ impl Default for ThinkingConfig {
 /// keys, downstream-fork-only keys, and "I'm trying out a future field early"
 /// workflows — a wider behavior change than this PR's mandate. If we want it
 /// later, it ships as its own decision.
+fn default_queue_wait_secs() -> u64 {
+    90
+}
+
+fn default_turn_timeout_secs() -> u64 {
+    900
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KernelConfig {
@@ -1212,6 +1220,26 @@ pub struct KernelConfig {
     /// Config hot-reload settings.
     #[serde(default)]
     pub reload: ReloadConfig,
+    /// How long a new message waits for a busy conversation before the caller
+    /// is told the agent is busy, in seconds. Default: 90.
+    ///
+    /// Messages arriving mid-turn wait for the running turn (per-thread
+    /// ordering), then run. If the wait exceeds this budget the call returns
+    /// `AgentBusy` immediately instead of blocking a channel worker or an API
+    /// request indefinitely — set it to 0 to fail fast, or raise it for
+    /// long-running agent workflows. Send `steer: true` to inject into the
+    /// running turn instead of queueing behind it.
+    #[serde(default = "default_queue_wait_secs")]
+    pub queue_wait_secs: u64,
+    /// Wall-clock budget for a single agent turn, in seconds. Default: 900.
+    ///
+    /// A turn that exceeds this is cancelled and the conversation is released,
+    /// so one wedged provider call or runaway tool loop cannot hold the
+    /// conversation lock until the daemon restarts. `0` disables the cap
+    /// (not recommended — a hung turn then blocks that conversation forever).
+    /// Raise it if you run genuinely long autonomous tasks.
+    #[serde(default = "default_turn_timeout_secs")]
+    pub turn_timeout_secs: u64,
     /// Webhook trigger configuration (external event injection).
     #[serde(default)]
     pub webhook_triggers: Option<WebhookTriggerConfig>,
@@ -1518,6 +1546,8 @@ impl Default for KernelConfig {
             media: crate::media::MediaConfig::default(),
             links: crate::media::LinkConfig::default(),
             reload: ReloadConfig::default(),
+            queue_wait_secs: default_queue_wait_secs(),
+            turn_timeout_secs: default_turn_timeout_secs(),
             webhook_triggers: None,
             approval: crate::approval::ApprovalPolicy::default(),
             max_cron_jobs: default_max_cron_jobs(),
@@ -3916,6 +3946,30 @@ impl KernelConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_work_handling_defaults() {
+        let cfg = KernelConfig::default();
+        assert_eq!(cfg.queue_wait_secs, 90, "busy wait default");
+        assert_eq!(cfg.turn_timeout_secs, 900, "turn budget default");
+    }
+
+    #[test]
+    fn test_work_handling_config_overridable() {
+        // Both knobs are plain scalars, so they must round-trip from TOML.
+        let toml = r#"
+queue_wait_secs = 5
+turn_timeout_secs = 0
+"#;
+        #[derive(serde::Deserialize)]
+        struct Partial {
+            queue_wait_secs: u64,
+            turn_timeout_secs: u64,
+        }
+        let p: Partial = toml::from_str(toml).unwrap();
+        assert_eq!(p.queue_wait_secs, 5);
+        assert_eq!(p.turn_timeout_secs, 0, "0 disables the cap");
+    }
+
     use super::*;
 
     #[test]

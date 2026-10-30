@@ -1971,6 +1971,14 @@ async fn dispatch_message(
 fn sanitize_agent_error(raw: &str) -> String {
     let lower = raw.to_lowercase();
 
+    // Still working on the previous message — a normal, retryable state, not
+    // a failure. Say so plainly instead of surfacing a mutex/timeout message.
+    if lower.contains("still working on the previous message") {
+        return "Still working on your previous message — I'll be ready in a moment. \
+                Send /stop to cancel it if you'd rather start over."
+            .to_string();
+    }
+
     if lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("429")
@@ -2009,6 +2017,14 @@ fn sanitize_agent_error(raw: &str) -> String {
         || lower.contains("internal error")
     {
         return "The AI service is temporarily overloaded, please try again shortly.".to_string();
+    }
+
+    // Turn-budget overrun: the agent was working, not failing. Users get a
+    // "it ran long" message rather than a generic error.
+    if lower.contains("turn timed out") {
+        return "That task ran past its time limit and was stopped. Try a smaller \
+                step, or send /stop first if something is still running."
+            .to_string();
     }
 
     if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline") {

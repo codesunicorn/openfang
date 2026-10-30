@@ -2041,7 +2041,45 @@ impl OpenFangKernel {
             .entry(lock_key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
-        let _guard = lock.lock().await;
+
+        // Bounded, observable wait. Without this, a second message during a
+        // long turn blocked silently on the mutex — a channel worker or HTTP
+        // request would hang for minutes with no feedback and no way to tell
+        // the user why. Now the wait is capped by `queue_wait_secs`; past it
+        // we return AgentBusy immediately so the caller can say "still working
+        // on the last request" instead of appearing frozen.
+        let wait_secs = self.config.queue_wait_secs;
+        let wait_deadline = std::time::Duration::from_secs(wait_secs);
+        let _guard = match lock.clone().try_lock_owned() {
+            // Uncontended fast path — the common case.
+            Ok(guard) => guard,
+            Err(_) => {
+                debug!(
+                    agent_id = %agent_id,
+                    wait_secs,
+                    "Conversation busy — waiting up to {}s for the running turn",
+                    wait_secs
+                );
+                match tokio::time::timeout(wait_deadline, lock.lock_owned()).await {
+                    Ok(guard) => {
+                        debug!(agent_id = %agent_id, "Busy wait finished; running queued message");
+                        guard
+                    }
+                    Err(_) => {
+                        warn!(
+                            agent_id = %agent_id,
+                            waited_secs = wait_secs,
+                            "Conversation still busy after wait budget — rejecting"
+                        );
+                        return Err(KernelError::OpenFang(OpenFangError::AgentBusy {
+                            message: format!(
+                                "still working on the previous message (waited {wait_secs}s). Send again shortly, or send with \"steer\": true to add to the running turn without waiting."
+                            ),
+                        }));
+                    }
+                }
+            }
+        };
 
         // Mark the turn as running so `is_agent_running()` is true on this
         // (non-streaming) path too — otherwise a steer request would start a
@@ -2522,7 +2560,8 @@ impl OpenFangKernel {
                     let _ = phase_tx.try_send(event);
                 });
 
-            let result = run_agent_loop_streaming(
+            let turn_budget = kernel_clone.config.turn_timeout_secs;
+            let turn_fut = run_agent_loop_streaming(
                 &manifest,
                 &message_owned,
                 &mut session,
@@ -2553,8 +2592,33 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 content_blocks,
-            )
-            .await;
+            );
+
+            // Same overall turn budget as the non-streaming path: a wedged
+            // streaming turn must not pin the conversation (and the client's
+            // stream) indefinitely.
+            let result = if turn_budget == 0 {
+                turn_fut.await
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(turn_budget),
+                    turn_fut,
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => {
+                        warn!(
+                            agent_id = %agent_id,
+                            turn_timeout_secs = turn_budget,
+                            "Streaming agent turn exceeded its budget — cancelled"
+                        );
+                        Err(OpenFangError::TurnTimeout {
+                            seconds: turn_budget,
+                        })
+                    }
+                }
+            };
 
             // Drop the phase callback immediately after the streaming loop
             // completes. It holds a clone of the stream sender (`tx`), which
@@ -3120,7 +3184,13 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        let result = run_agent_loop(
+        // Overall turn budget. The per-request LLM timeout bounds a single
+        // provider call, and max_iterations bounds tool loops, but a turn can
+        // still wedge (a tool that never returns, a provider that trickles
+        // bytes forever). Without this cap such a turn holds the conversation
+        // lock until restart, and every later message queues behind it.
+        let turn_budget = self.config.turn_timeout_secs;
+        let turn_fut = run_agent_loop(
             &manifest,
             &message_with_links,
             &mut session,
@@ -3150,9 +3220,29 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
-        )
-        .await
-        .map_err(KernelError::OpenFang)?;
+        );
+
+        let result = if turn_budget == 0 {
+            turn_fut.await.map_err(KernelError::OpenFang)?
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(turn_budget), turn_fut)
+                .await
+            {
+                Ok(res) => res.map_err(KernelError::OpenFang)?,
+                Err(_) => {
+                    // The future is dropped here, which cancels the loop and
+                    // releases the conversation lock via the turn guard.
+                    warn!(
+                        agent_id = %agent_id,
+                        turn_timeout_secs = turn_budget,
+                        "Agent turn exceeded its budget — cancelled"
+                    );
+                    return Err(KernelError::OpenFang(OpenFangError::TurnTimeout {
+                        seconds: turn_budget,
+                    }));
+                }
+            }
+        };
 
         // Append new messages to canonical session for cross-channel memory
         if session.messages.len() > messages_before {
@@ -8287,6 +8377,47 @@ mod tests {
     use super::*;
     use openfang_types::config::ExecPolicy;
     use std::collections::HashMap;
+
+    /// The conversation lock must not block indefinitely. Regression test for
+    /// the silent 32s hang measured when a second message arrived mid-turn:
+    /// the wait has to be bounded and then produce a retryable `AgentBusy`.
+    #[tokio::test]
+    async fn test_conversation_lock_wait_is_bounded() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.clone().lock_owned().await;
+
+        // A zero budget must fail fast rather than block.
+        let wait = tokio::time::timeout(
+            std::time::Duration::from_secs(0),
+            lock.clone().lock_owned(),
+        )
+        .await;
+        assert!(wait.is_err(), "zero budget must not acquire a held lock");
+
+        // A short budget elapsed while the guard is still held must also fail,
+        // and must do so promptly rather than hanging.
+        let started = std::time::Instant::now();
+        let wait = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            lock.clone().lock_owned(),
+        )
+        .await;
+        assert!(wait.is_err(), "held lock must time out");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "timeout must fire near its budget, not hang"
+        );
+
+        // Once released, the same lock is acquirable again — a rejected
+        // message must not wedge the conversation permanently.
+        drop(held);
+        let acquired = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lock.lock_owned(),
+        )
+        .await;
+        assert!(acquired.is_ok(), "lock must be reusable after release");
+    }
 
     #[test]
     fn test_manifest_to_capabilities() {

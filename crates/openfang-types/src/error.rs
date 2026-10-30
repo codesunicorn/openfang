@@ -9,6 +9,25 @@ pub enum OpenFangError {
     #[error("Agent not found: {0}")]
     AgentNotFound(String),
 
+    /// A single agent turn exceeded its wall-clock budget and was cancelled.
+    ///
+    /// Distinct from `AgentBusy` (a *different* message waiting) — this means
+    /// the turn itself was wedged, e.g. a hung provider, a tool that never
+    /// returns, or a tool loop spinning past its iteration cap.
+    #[error("turn timed out after {seconds}s")]
+    TurnTimeout {
+        /// The configured budget that was exceeded.
+        seconds: u64,
+    },
+
+    /// The agent is mid-turn on this conversation and cannot accept a new
+    /// message right now. Carries the wait time so callers can report it.
+    #[error("agent busy: {message}")]
+    AgentBusy {
+        /// Human-readable guidance (includes how long the caller waited).
+        message: String,
+    },
+
     /// An agent with this name or ID already exists.
     #[error("Agent already exists: {0}")]
     AgentAlreadyExists(String),

@@ -49,6 +49,7 @@ use openfang_channels::reddit::RedditAdapter;
 use openfang_channels::revolt::RevoltAdapter;
 #[cfg(feature = "viber")]
 use openfang_channels::viber::ViberAdapter;
+#[cfg(feature = "feishu")]
 use openfang_types::config::FeishuMode;
 // Wave 4
 #[cfg(feature = "flock")]

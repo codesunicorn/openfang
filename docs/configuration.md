@@ -1409,6 +1409,30 @@ usage_footer = "tokens"
 
 ---
 
+## Work handling (task ordering and turn budgets)
+
+Two root-level knobs govern what happens when work arrives faster than the
+agent can finish it:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `queue_wait_secs` | `90` | How long a new message waits for a busy conversation. Past this the caller gets `503` + `Retry-After` instead of blocking. `0` fails fast. |
+| `turn_timeout_secs` | `900` | Wall-clock budget for one turn. A wedged turn is cancelled and the conversation released. `0` disables the cap. |
+
+Behaviour:
+
+- **Same conversation** — messages are ordered. A second message waits up to
+  `queue_wait_secs` for the running turn, then runs. If the budget is exceeded
+  the call returns `AgentBusy` immediately (API: `503` with `retryable: true`;
+  Discord/Telegram: *"Still working on your previous message…"*).
+- **Different threads** — each Discord thread has its own conversation and
+  lock, so threads run concurrently.
+- **Don't want to wait?** Send `"steer": true` with the API call to append to
+  the running turn instead (returns instantly), or `/stop` to cancel it.
+- **Wedged turn** — if a turn exceeds `turn_timeout_secs` it is cancelled
+  (`504` on the API, *"That task ran past its time limit"* on channels) and the
+  conversation lock is released, so the next message is not stuck behind it.
+
 ## Code kernel (`code_execute`)
 
 Agents granted the `code_execute` tool get a **persistent Python interpreter**
